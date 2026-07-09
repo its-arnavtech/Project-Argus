@@ -51,6 +51,8 @@ def kaggle_credentials_present() -> bool:
     kaggle_dir = Path.home() / ".kaggle"
     if (kaggle_dir / "access_token").exists():
         return True
+    if (kaggle_dir / "credentials.json").exists():
+        return True
     if (kaggle_dir / "kaggle.json").exists():
         return True
     return False
@@ -67,12 +69,16 @@ NOT the classic kaggle.json workflow most tutorials describe):
 
   Option A (recommended) -- OAuth login, no token file to manage:
     kaggle auth login
+    (observed to write ~/.kaggle/credentials.json -- also checked here)
 
   Option B -- API token:
     1. Go to https://www.kaggle.com/settings/api and click "Generate New Token"
     2. Either:
        - export KAGGLE_API_TOKEN=<token>          (env var), or
        - save the token to ~/.kaggle/access_token  (file)
+
+  Note: if the `kaggle` command isn't on PATH after install, use
+  `python -m kaggle ...` instead.
 
   You must also accept the competition rules at
   https://www.kaggle.com/c/ieee-fraud-detection/rules before download works.
@@ -93,12 +99,16 @@ def download_real_dataset(raw_dir: Path) -> bool:
         import kaggle  # noqa: F401 -- import deferred: raises if unauthenticated
 
         kaggle.api.authenticate()
-        kaggle.api.competition_download_files(COMPETITION, path=str(raw_dir), quiet=False)
-        zip_path = raw_dir / f"{COMPETITION}.zip"
-        if zip_path.exists():
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(raw_dir)
-            zip_path.unlink()
+        # Download only the two files we actually consume -- competition_download_files()
+        # would pull test_transaction.csv/test_identity.csv/sample_submission.csv too
+        # (~640MB of unlabeled data we have no use for).
+        for fname in ("train_transaction.csv", "train_identity.csv"):
+            kaggle.api.competition_download_file(COMPETITION, fname, path=str(raw_dir), quiet=False)
+            zip_path = raw_dir / f"{fname}.zip"
+            if zip_path.exists():
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(raw_dir)
+                zip_path.unlink()
         required = raw_dir / "train_transaction.csv"
         return required.exists()
     except Exception as exc:  # noqa: BLE001 -- any failure here must not block the pipeline

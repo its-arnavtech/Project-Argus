@@ -1,7 +1,7 @@
 # Rust
 target/
 **/target/
-Cargo.lock
+# Cargo.lock is committed (binary crates) -- do not ignore it
 
 # Python
 __pycache__/
