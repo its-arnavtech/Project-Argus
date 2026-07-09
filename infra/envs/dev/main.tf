@@ -94,3 +94,26 @@ module "budget_alert" {
   alert_email       = var.alert_email
   start_date        = var.budget_start_date
 }
+
+# Dev-only bridge: lets the current az CLI identity (this developer) send to
+# Event Hubs directly for local ingestion testing (Chunk 4). Chunk 10
+# replaces this with the Container App's managed identity once the ingestion
+# service is actually deployed there -- this is not the production auth
+# path, which is why it's kept here (env-specific) rather than folded into
+# the reusable event_hubs module.
+resource "azurerm_role_assignment" "dev_eventhub_sender" {
+  scope                = module.event_hubs.namespace_id
+  role_definition_name = "Azure Event Hubs Data Sender"
+  principal_id         = data.azurerm_client_config.current.object_id
+}
+
+# Chunk 4 validation needs to read events back to confirm delivery (not just
+# send), which the Sender role above doesn't cover ("Listen" claims are a
+# separate grant from "Send" claims in Event Hubs' AMQP claim model). Same
+# dev-only scope and caveat as the Sender grant above -- not the production
+# auth path.
+resource "azurerm_role_assignment" "dev_eventhub_receiver" {
+  scope                = module.event_hubs.namespace_id
+  role_definition_name = "Azure Event Hubs Data Receiver"
+  principal_id         = data.azurerm_client_config.current.object_id
+}

@@ -9,8 +9,8 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 1 — Real data acquisition + synthetic ring simulator
 - [x] Chunk 2 — Rust ingestion engine v1 (local)
 - [x] Chunk 3 — Azure infra via Terraform
-- [ ] Chunk 4 — Wire ingestion to real Azure Event Hubs  ← IN PROGRESS
-- [ ] Chunk 5 — Cosmos DB graph schema + loader
+- [x] Chunk 4 — Wire ingestion to real Azure Event Hubs
+- [ ] Chunk 5 — Cosmos DB graph schema + loader  ← IN PROGRESS
 - [ ] Chunk 6 — GNN training pipeline
 - [ ] Chunk 7 — Real-time GNN inference service
 - [ ] Chunk 8 — LangGraph agentic compliance loop
@@ -20,8 +20,8 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [ ] Chunk 12 — Docs polish & demo packaging
 
 ## Current State
-- Active chunk: 4
-- Exact next action: run Chunk 4 prompt (wire ingestion to real Azure Event Hubs — add `EventHubSink` to ingestion/src/lib.rs wrapping azure_messaging_eventhubs, pull the namespace connection string into Key Vault, deploy the ingestion service into the Container Apps environment)
+- Active chunk: 5
+- Exact next action: run Chunk 5 prompt (Cosmos DB graph schema + loader — create the actual Gremlin graph/container in `cosmos-argus-dev-to614f`'s `argus-graph` database per PDD section 1's vertex/edge schema, and load Chunk 1's data/simulated/ Parquet output into it)
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -155,16 +155,58 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   exists yet to split it with (Chunk 5), so this just uses headroom that
   was already free rather than leaving it unused ahead of loading the
   real 590K-account graph.
+- 2026-07-09 — Chunk 4: `EventHubSink` authenticates via Azure AD
+  (`DeveloperToolsCredential`, which tries `AzureCliCredential` first) with
+  RBAC role assignments scoped to the namespace, not a static connection
+  string. No secret to leak, rotate, or accidentally commit -- this is the
+  same reasoning Key Vault (Chunk 3) and PII salt (Chunk 10) already follow,
+  now extended to the transport layer. The dev-only RBAC grants (below) are
+  an explicit bridge, not the production path: Chunk 10 points the same
+  `Sink` trait at the Container App's managed identity instead, with zero
+  changes to `EventHubSink` itself, since both credential types implement
+  the same `azure_core::credentials::TokenCredential` trait.
+- 2026-07-09 — Chunk 4: confirmed azure_messaging_eventhubs v0.15.0's real
+  API before writing any code, per the task's own instruction -- docs.rs's
+  rendered pages didn't resolve via automated fetch (redirect-only
+  content), so verified against the crate's own tests/examples in the
+  azure-sdk-for-rust GitHub repo instead. Two things differed from
+  training-data expectations: (1) the credential type is
+  `DeveloperToolsCredential` (tries `AzureCliCredential` then
+  `AzureDeveloperCliCredential`), not `DefaultAzureCredential` -- that name
+  doesn't exist in this SDK generation. (2) `ProducerClient::builder().open()`
+  takes `eventhub: &str`, but `ConsumerClient::builder().open()` takes
+  `eventhub: String` (owned) -- an inconsistency between the two builders,
+  not a typo on our part; confirmed directly against both functions' source.
+  Confirmed API otherwise: `ProducerClient::send_event(impl Into<EventData>,
+  Option<SendEventOptions>)`, `ConsumerClient::open_receiver_on_partition(...)`
+  + `EventReceiver::stream_events()` (a `futures::Stream`).
+- 2026-07-09 — Chunk 4: the dev-only RBAC bridge needed both "Azure Event
+  Hubs Data Sender" AND "Azure Event Hubs Data Receiver" roles, not just
+  Sender -- Event Hubs' AMQP claim model separates "Send" and "Listen"
+  claims, and Chunk 4's own validation step (read events back to confirm
+  delivery) needs Listen. First apply (Sender only) let 3,000 events send
+  successfully but failed to read them back with `UnauthorizedAccess`
+  ('Listen' claims required); added the Receiver role in a second
+  reviewed/approved plan+apply rather than silently over-granting Owner
+  upfront.
+- 2026-07-09 — Chunk 4: retry is layered, not singular. The SDK's own
+  `RetryOptions` (passed via `.with_retry_options(...)` on the producer
+  builder) governs internal AMQP link/connection recovery; `EventHubSink`
+  additionally wraps its own `send_event` call in a small explicit retry
+  (3 attempts, exponential backoff starting at 200ms) at the Sink layer,
+  since the task asked for retry "around the send call" specifically, and
+  the SDK's internal retry helpers (`recover_with_backoff`) are
+  `pub(crate)` -- not something a crate consumer can hook into directly.
 
 ## Environment & Resource Reference
 
 Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed with the user 2026-07-09 as the ~$75 credit grant subscription. Region: East US 2 (eastus2) for all resources. Provisioned via infra/envs/dev (tier=dev):
 
 - Resource group: `rg-argus-dev`
-- Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention)
+- Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
 - Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`) -- Chunk 5 creates the actual graph/container
-- Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- empty, no secrets yet (Chunk 4/10)
-- Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (Chunk 4)
+- Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- still empty; Chunk 4 authenticated to Event Hubs via Azure AD/RBAC instead of a connection string, so no secret was needed here yet. Chunk 10 will use it for whatever genuinely needs a stored secret in production.
+- Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (still pending; not this chunk's scope either)
 - Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to redacted@example.com
 
 Connection strings, keys, and the random suffix's source are in Terraform state (`infra/envs/dev/terraform.tfstate`, gitignored) -- never in this file.
@@ -188,12 +230,17 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   future chunk's `terraform apply` fails with
   `MissingSubscriptionRegistration`, run
   `az provider register -n <Namespace>` and re-plan/re-apply.
+- Chunk 4's validation left ~6,000 test events sitting in the `transactions`
+  hub (two 3,000-event validation runs). Harmless — 1-day retention means
+  they age out on their own — but Chunk 5's Cosmos loader should expect
+  this test traffic if it ever reads directly from the hub instead of
+  `data/simulated/`.
 - No ML/agent code yet.
 
 ## File Map
 - `docs/` — `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` scaffolded, empty
 - `data/` — `scripts/` holds `graph_schema.py` (shared vertex/edge schema + real-data derivation), `acquire_ieee_cis.py` (Kaggle acquisition + bundled-sample fallback), `ring_injector.py` (synthetic ring injection), `eda_report.py` (validation/EDA); `raw/` and `simulated/` are gitignored but currently populated (bundled sample + 45 injected rings) — regenerate anytime via the three scripts in order
-- `ingestion/` — real Cargo crate: `src/lib.rs` (RawTransaction/EnrichedTransaction, `Sink` trait, `LocalFileSink`/`StdoutSink`, SHA-256 PII masking, 8 passing unit/integration tests), `src/main.rs` (binary entrypoint reading `data/simulated/funds_transfer_raw.jsonl`); Chunk 4 adds `EventHubSink`
+- `ingestion/` — real Cargo crate: `src/lib.rs` (RawTransaction/EnrichedTransaction, `Sink` trait, `LocalFileSink`/`StdoutSink`, SHA-256 PII masking, 8 passing unit/integration tests), `src/event_hub_sink.rs` (`EventHubSink` -- Azure AD auth via `DeveloperToolsCredential`, retry w/ backoff), `src/main.rs` (binary entrypoint; `ARGUS_SINK=eventhub` targets real Event Hubs, `ARGUS_EVENT_LIMIT` caps volume), `examples/eventhub_validate.rs` (send+read-back round-trip check); Chunk 5 is next
 - `ml/` — `training/`, `inference/` scaffolded, empty
 - `agents/` — scaffolded, empty (LangGraph compliance loop lands Chunk 8)
 - `graph/` — scaffolded, empty (Cosmos DB schema + loader lands Chunk 5)
@@ -258,5 +305,21 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
 - 2026-07-09 — Claude Code — Cosmos DB throughput bumped 400→1000 RU/s
   (infra/modules/cosmos_db, infra/envs/dev tier config), applied cleanly
   as a single in-place update, still $0 under free tier.
+- 2026-07-09 — Claude Code — Chunk 4 — wired the Rust ingestion engine to
+  real Azure Event Hubs. Confirmed azure_messaging_eventhubs v0.15.0's
+  actual API against the SDK's own GitHub source first (docs.rs didn't
+  resolve via fetch); found `DeveloperToolsCredential` replaces
+  `DefaultAzureCredential`, and `ConsumerClient::open()` takes an owned
+  `String` for eventhub name where `ProducerClient::open()` takes `&str`.
+  Added `EventHubSink` (src/event_hub_sink.rs) with Azure AD auth (no
+  connection string), layered retry (SDK RetryOptions + a 3-attempt
+  exponential-backoff wrapper at the Sink layer), wired into main.rs behind
+  `ARGUS_SINK=eventhub`. Terraform: added two dev-only role assignments
+  (Data Sender, then Data Receiver once validation revealed Sender alone
+  can't read events back) on evhns-argus-dev-to614f, each shown as a
+  1-resource plan and approved before applying. Validation
+  (examples/eventhub_validate.rs): sent 3,000 real transactions through the
+  full engine, read all 3,000 back (1,500/partition) after fixing the
+  receiver RBAC gap -- confirmed round-trip delivery.
 
 Last updated: 2026-07-09 by Claude Code

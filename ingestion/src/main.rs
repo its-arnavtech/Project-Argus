@@ -1,9 +1,12 @@
 //! Thin binary entrypoint: wires up a `Sink` from env vars, reads
 //! newline-delimited `RawTransaction` JSON from `data/simulated/` (Chunk 1's
 //! export, see data/scripts/export_ingestion_jsonl.py), and runs it through
-//! `IngestionEngine`. No Azure Event Hubs yet -- that's Chunk 4.
+//! `IngestionEngine`. `ARGUS_SINK=eventhub` (Chunk 4) sends to the real
+//! Event Hubs namespace via Azure AD auth -- set `ARGUS_EVENT_LIMIT` when
+//! using it against the full real corpus so a 1-TU dev namespace doesn't
+//! get blasted with all ~590K rows at once.
 
-use ingestion::{pii_salt_from_env, IngestionEngine, LocalFileSink, Sink, StdoutSink};
+use ingestion::{pii_salt_from_env, EventHubSink, IngestionEngine, LocalFileSink, Sink, StdoutSink};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -22,6 +25,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "ingested_output.jsonl".to_string());
             println!("[INITIALIZATION] Sink: LocalFileSink -> {path}");
             Arc::new(LocalFileSink::new(&path).await?)
+        }
+        Ok("eventhub") => {
+            let namespace_hostname = std::env::var("ARGUS_EVENTHUB_NAMESPACE").unwrap_or_else(|_| {
+                "evhns-argus-dev-to614f.servicebus.windows.net".to_string()
+            });
+            let eventhub_name =
+                std::env::var("ARGUS_EVENTHUB_NAME").unwrap_or_else(|_| "transactions".to_string());
+            println!("[INITIALIZATION] Sink: EventHubSink -> {namespace_hostname}/{eventhub_name}");
+            Arc::new(EventHubSink::new(&namespace_hostname, &eventhub_name).await?)
         }
         _ => {
             println!("[INITIALIZATION] Sink: StdoutSink");
@@ -42,9 +54,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let mut lines = BufReader::new(file).lines();
 
+    let limit: Option<usize> = std::env::var("ARGUS_EVENT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(limit) = limit {
+        println!("[INITIALIZATION] Capping this run at {limit} events (ARGUS_EVENT_LIMIT).");
+    }
+
     let mut handles = Vec::new();
     let mut count = 0usize;
     while let Some(line) = lines.next_line().await? {
+        if limit.is_some_and(|limit| count >= limit) {
+            break;
+        }
         if line.trim().is_empty() {
             continue;
         }

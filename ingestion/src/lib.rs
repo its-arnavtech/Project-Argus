@@ -11,6 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+mod event_hub_sink;
+pub use event_hub_sink::EventHubSink;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RawTransaction {
     pub transaction_id: String,
