@@ -150,6 +150,11 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   the Rust ingestion engine against the full real corpus: 590,860 events
   drained in ~64s (~9,200 events/sec, LocalFileSink release build) with no
   errors -- consistent with Chunk 2's synthetic-load throughput numbers.
+  Cosmos DB throughput bumped 400→1000 RU/s post-apply, still $0 under
+  free tier -- 1000 RU/s is the free tier's max and no container/graph
+  exists yet to split it with (Chunk 5), so this just uses headroom that
+  was already free rather than leaving it unused ahead of loading the
+  real 590K-account graph.
 
 ## Environment & Resource Reference
 
@@ -157,7 +162,7 @@ Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed
 
 - Resource group: `rg-argus-dev`
 - Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention)
-- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 400 RU/s; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`) -- Chunk 5 creates the actual graph/container
+- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`) -- Chunk 5 creates the actual graph/container
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- empty, no secrets yet (Chunk 4/10)
 - Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (Chunk 4)
 - Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to redacted@example.com
@@ -250,5 +255,8 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   export and re-verified the Rust engine against the full 590,860-row
   real corpus (~9,200 events/sec, no errors). README Data Sources and
   Chunk 1 EDA doc now reflect real numbers throughout.
+- 2026-07-09 — Claude Code — Cosmos DB throughput bumped 400→1000 RU/s
+  (infra/modules/cosmos_db, infra/envs/dev tier config), applied cleanly
+  as a single in-place update, still $0 under free tier.
 
 Last updated: 2026-07-09 by Claude Code

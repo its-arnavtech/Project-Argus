@@ -33,8 +33,8 @@ variable "database_name" {
 
 variable "throughput" {
   type        = number
-  description = "Gremlin database RU/s (manual, increments of 100, minimum 400). PDD_Production_Guide.md section 2 specifies 10,000-100,000 RU/s autopilot for the enterprise tier."
-  default     = 400
+  description = "Gremlin database (shared) RU/s -- manual, increments of 100, minimum 400. Free tier covers up to 1000 RU/s + 25GB at $0; default is set to that max since no container/graph exists yet to split it with (Chunk 5). PDD_Production_Guide.md section 2 specifies 10,000-100,000 RU/s autopilot for the enterprise tier."
+  default     = 1000
 }
 
 variable "tags" {

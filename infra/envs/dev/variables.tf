@@ -5,8 +5,8 @@
 #   - "dev"        (default): budget-capped, scaled-down tier for this
 #                   portfolio build (~$75 total remaining cloud budget).
 #                   Standard Event Hubs, 2 partitions, 1-day retention,
-#                   Cosmos free tier at 400 RU/s, single region, Consumption
-#                   Container Apps.
+#                   Cosmos free tier at 1000 RU/s (the free tier's max --
+#                   still $0), single region, Consumption Container Apps.
 #   - "enterprise": the literal bank-scale spec from
 #                   docs/specs/PDD_Production_Guide.md section 2 -- Premium
 #                   Event Hubs, 32 partitions, 7-day retention, Cosmos
@@ -42,7 +42,7 @@ locals {
       eventhub_partition_count = 2
       eventhub_retention_days  = 1
       cosmos_free_tier         = true
-      cosmos_throughput        = 400
+      cosmos_throughput        = 1000
       cosmos_multi_region      = false
       cosmos_autopilot         = false
     }
