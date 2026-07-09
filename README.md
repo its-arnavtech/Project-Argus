@@ -84,7 +84,7 @@ tests/
 
 ## Status
 
-This is an active build. Roadmap and progress are tracked in [context.md](Context.md), not here — check it for the current chunk, next action, and session history.
+This is an active build. Roadmap and progress are tracked in [context.md](context.md), not here — check it for the current chunk, next action, and session history.
 
 ## Data Sources
 

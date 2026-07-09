@@ -48,7 +48,7 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - `dashboards/` — scaffolded, empty (Tableau lands Chunk 9)
 - `tests/` — `unit/`, `integration/`, `load/` scaffolded, empty
 - `.github/workflows/` — scaffolded, empty (CI lands later chunks)
-- Root — `README.md`, `LICENSE` (MIT), `.gitignore`, `Context.md` (this file)
+- Root — `README.md`, `LICENSE` (MIT), `.gitignore`, `context.md` (this file)
 
 ## Session Log
 - 2026-07-09 — Claude Code — Chunk 0 — bootstrapped repo structure, .gitignore, LICENSE, README, context.md.
