@@ -37,6 +37,17 @@ variable "throughput" {
   default     = 1000
 }
 
+variable "graph_name" {
+  type    = string
+  default = "argus-graph-container"
+}
+
+variable "partition_key_path" {
+  type        = string
+  description = "Single shared, low-cardinality partition key path across every vertex/edge type -- not one key per vertex label. See docs/architecture/partition_key_strategy.md for why (already a resolved decision)."
+  default     = "/partitionKey"
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

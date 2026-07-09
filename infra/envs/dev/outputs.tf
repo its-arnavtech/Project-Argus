@@ -26,6 +26,14 @@ output "cosmos_endpoint" {
   value = module.cosmos_db.endpoint
 }
 
+output "cosmos_graph_name" {
+  value = module.cosmos_db.graph_name
+}
+
+output "cosmos_partition_key_path" {
+  value = module.cosmos_db.partition_key_path
+}
+
 output "key_vault_name" {
   value = module.key_vault.key_vault_name
 }

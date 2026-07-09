@@ -315,6 +315,10 @@ def inject_rings(tables: GraphTables, seed: int = SEED):
     ud_out = pd.concat([tables.used_device] + new_ud, ignore_index=True) if new_ud else tables.used_device
 
     manifest = pd.DataFrame(manifest_rows)
+    # Ring-injected accounts don't get their own OWNS edges here (out of
+    # scope for the OWNS-edge addition that introduced this field -- see
+    # graph_schema.py); their Customer records still exist, just not linked
+    # by an edge yet. Passed through unchanged from the background tables.
     return (
         GraphTables(
             accounts=accounts_out,
@@ -326,6 +330,7 @@ def inject_rings(tables: GraphTables, seed: int = SEED):
             accessed_from=af_out,
             used_device=ud_out,
             settled_at=tables.settled_at,
+            owns=tables.owns,
         ),
         manifest,
     )
@@ -355,6 +360,7 @@ def main() -> None:
     full_tables.accessed_from.to_parquet(SIM_DIR / "edges_accessed_from.parquet", index=False)
     full_tables.used_device.to_parquet(SIM_DIR / "edges_used_device.parquet", index=False)
     full_tables.settled_at.to_parquet(SIM_DIR / "edges_settled_at.parquet", index=False)
+    full_tables.owns.to_parquet(SIM_DIR / "edges_owns.parquet", index=False)
     manifest.to_parquet(SIM_DIR / "rings_manifest.parquet", index=False)
 
     print(

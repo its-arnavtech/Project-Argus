@@ -20,8 +20,16 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [ ] Chunk 12 — Docs polish & demo packaging
 
 ## Current State
-- Active chunk: 5
-- Exact next action: run Chunk 5 prompt (Cosmos DB graph schema + loader — create the actual Gremlin graph/container in `cosmos-argus-dev-to614f`'s `argus-graph` database per PDD section 1's vertex/edge schema, and load Chunk 1's data/simulated/ Parquet output into it)
+- Active chunk: 5 (prep work done, not complete)
+- Exact next action: build the Chunk 5 loader — the Gremlin graph container
+  (`argus-graph-container`) now exists with its partition key and indexing
+  policy resolved (see Architectural Decisions Log and
+  docs/architecture/partition_key_strategy.md), and `graph_schema.py` now
+  defines the OWNS edge. Still needed: the actual loader that reads
+  data/simulated/*.parquet, stamps a `partitionKey` value onto every
+  vertex/edge (per the partition key strategy doc), and writes them into
+  `argus-graph-container` via the Gremlin API; then traversal validation
+  against the loaded graph.
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -197,6 +205,40 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   since the task asked for retry "around the send call" specifically, and
   the SDK's internal retry helpers (`recover_with_backoff`) are
   `pub(crate)` -- not something a crate consumer can hook into directly.
+- 2026-07-09 — Chunk 5 prep: resolved the Gremlin partition key model.
+  Cosmos DB Gremlin graphs are one container with one partition key --
+  not one container per vertex label, despite PDD_Production_Guide.md
+  section 1's table having a per-row "Partition Key" column. That table is
+  reinterpreted as indexing policy guidance instead (applied via
+  `index_policy`'s `composite_index` blocks on `argus-graph-container`,
+  covering risk_base, mcc_code, hop_distance, gnn_risk_score). The
+  container uses a single low-cardinality shared key (`/partitionKey`),
+  not a high-cardinality key like `acct_id`: data volume (~40K accounts,
+  ~590K edges) is well under one physical partition's capacity, every
+  fraud-detection traversal is inherently cross-entity (multi-hop tracing,
+  shared-device clustering), and a shared key keeps every traversal
+  same-partition rather than fanning out cross-partition on nearly every
+  query. Trades away horizontal write scaling we don't need at this scale
+  for query performance we do need. Full reasoning:
+  docs/architecture/partition_key_strategy.md. The container has no
+  `throughput`/`autoscale_settings` block -- it draws from `argus-graph`
+  database's existing 1000 RU/s shared pool. Confirmed against Microsoft
+  Learn docs (not assumed): free tier covers a shared-throughput database
+  up to 25 containers at $0; this is the 1st of 25, so it's still $0.
+- 2026-07-09 — Chunk 5 prep: added a 5th edge, OWNS (Customer -> Account),
+  on top of PDD_Production_Guide.md section 1's literal 4-edge list
+  (FUNDS_TRANSFER, ACCESSED_FROM, USED_DEVICE, SETTLED_AT) -- a deliberate,
+  flagged deviation, not an oversight. This resolves the question Chunk 1
+  flagged and deferred (whether Account's `cust_id` foreign key should
+  become a real edge). Kept `cust_id` on Account too (harmless, useful for
+  quick pandas joins outside Gremlin). Updated `data/scripts/graph_schema.py`
+  (`derive_account_universe` now returns an `owns` table; `GraphTables`
+  gained an `owns` field) and `ring_injector.py` (passes `tables.owns`
+  through unchanged, writes `edges_owns.parquet`). Ring-injected accounts
+  do NOT get their own OWNS edges yet -- out of scope for this narrow fix;
+  their Customer records exist but aren't edge-linked. Data not
+  regenerated in this session (this is schema/infra prep, not a pipeline
+  rerun); takes effect next time `ring_injector.py` actually runs.
 
 ## Environment & Resource Reference
 
@@ -204,7 +246,7 @@ Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed
 
 - Resource group: `rg-argus-dev`
 - Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
-- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`) -- Chunk 5 creates the actual graph/container
+- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (no dedicated throughput -- 1st of 25 free-tier containers, still $0) -- loader (Chunk 5 proper) still ahead
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- still empty; Chunk 4 authenticated to Event Hubs via Azure AD/RBAC instead of a connection string, so no secret was needed here yet. Chunk 10 will use it for whatever genuinely needs a stored secret in production.
 - Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (still pending; not this chunk's scope either)
 - Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to redacted@example.com
@@ -238,13 +280,13 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
 - No ML/agent code yet.
 
 ## File Map
-- `docs/` — `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` scaffolded, empty
+- `docs/` — `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` holds chunk1_data_eda_summary.md and partition_key_strategy.md (Gremlin partition key + indexing policy reasoning)
 - `data/` — `scripts/` holds `graph_schema.py` (shared vertex/edge schema + real-data derivation), `acquire_ieee_cis.py` (Kaggle acquisition + bundled-sample fallback), `ring_injector.py` (synthetic ring injection), `eda_report.py` (validation/EDA); `raw/` and `simulated/` are gitignored but currently populated (bundled sample + 45 injected rings) — regenerate anytime via the three scripts in order
 - `ingestion/` — real Cargo crate: `src/lib.rs` (RawTransaction/EnrichedTransaction, `Sink` trait, `LocalFileSink`/`StdoutSink`, SHA-256 PII masking, 8 passing unit/integration tests), `src/event_hub_sink.rs` (`EventHubSink` -- Azure AD auth via `DeveloperToolsCredential`, retry w/ backoff), `src/main.rs` (binary entrypoint; `ARGUS_SINK=eventhub` targets real Event Hubs, `ARGUS_EVENT_LIMIT` caps volume), `examples/eventhub_validate.rs` (send+read-back round-trip check); Chunk 5 is next
 - `ml/` — `training/`, `inference/` scaffolded, empty
 - `agents/` — scaffolded, empty (LangGraph compliance loop lands Chunk 8)
 - `graph/` — scaffolded, empty (Cosmos DB schema + loader lands Chunk 5)
-- `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure as of Chunk 3 (see Environment & Resource Reference)
+- `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
 - `dashboards/` — scaffolded, empty (Tableau lands Chunk 9)
 - `tests/` — `unit/`, `integration/`, `load/` scaffolded, empty
 - `.github/workflows/` — scaffolded, empty (CI lands later chunks)
@@ -321,5 +363,21 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   (examples/eventhub_validate.rs): sent 3,000 real transactions through the
   full engine, read all 3,000 back (1,500/partition) after fixing the
   receiver RBAC gap -- confirmed round-trip delivery.
+- 2026-07-09 — Claude Code — Chunk 5 prep (not complete -- loader and
+  traversal validation still ahead). Resolved the Gremlin partition key
+  model: one container (`argus-graph-container`) with one shared
+  low-cardinality partition key (`/partitionKey`), not per-vertex-label
+  containers; PDD section 1's per-row "Partition Key" column reinterpreted
+  as indexing guidance, applied via composite indexes on risk_base,
+  mcc_code, hop_distance, gnn_risk_score. Confirmed against Microsoft Learn
+  docs that this container (no dedicated throughput) shares the database's
+  existing free-tier 1000 RU/s at $0 (1st of 25 allowed containers).
+  Reasoning documented in docs/architecture/partition_key_strategy.md.
+  Terraform: added azurerm_cosmosdb_gremlin_graph to modules/cosmos_db,
+  shown as a 1-resource plan, approved, applied. Also added the OWNS
+  (Customer -> Account) edge to data/scripts/graph_schema.py -- a flagged
+  deviation from the PDD's literal 4-edge list, resolving Chunk 1's
+  deferred question about `cust_id`. Code only; data/simulated/ not
+  regenerated this session.
 
 Last updated: 2026-07-09 by Claude Code

@@ -5,6 +5,8 @@ Vertex/edge LABELS and their PROPERTY columns below are frozen to the exact
 ontology in docs/specs/PDD_Production_Guide.md section 1:
   Vertices: Account, Customer, Device, IPAddress, Merchant
   Edges:    FUNDS_TRANSFER, ACCESSED_FROM, USED_DEVICE, SETTLED_AT
+Plus OWNS (Customer -> Account), added on top of the PDD's literal 4 -- see
+note 1 below; this is a deliberate, flagged deviation, not an oversight.
 
 The PDD table documents each edge's properties but not its endpoint vertex
 types -- a property-graph schema doesn't need that (an edge just connects
@@ -18,12 +20,13 @@ not new schema properties:
 
 Two more additions beyond the documented columns, both flagged here rather
 than silently introduced:
-  1. Account carries a `cust_id` foreign key. The PDD lists Customer as a
-     vertex but documents no Customer<->Account edge, and the task
-     explicitly scoped the edge set to the 4 labels above -- so ownership
-     is modeled as a join key for now rather than inventing a 5th edge
-     type. Chunk 5's Cosmos loader should decide whether this becomes a
-     real edge (e.g. OWNS) or stays a vertex property.
+  1. RESOLVED: Account<->Customer ownership is now a real edge, OWNS
+     (Customer -> Account), added alongside the 4 PDD-defined edges below.
+     The PDD lists Customer as a vertex but documents no Customer<->Account
+     edge; Chunk 1 originally deferred this to a `cust_id` foreign key,
+     flagged for Chunk 5 to decide. Kept `cust_id` on Account too (harmless,
+     useful for quick pandas joins outside Gremlin) -- OWNS is what actually
+     makes Customer traversable from Account in the graph.
   2. Every vertex/edge row carries `provenance` (real_kaggle | bundled_sample
      | synthetic_ring) and ring-labeling columns (`is_ring_member`,
      `ring_id`, `ring_type` on Account; `is_synthetic`, `ring_id` on edges).
@@ -59,6 +62,7 @@ FUNDS_TRANSFER_PROPS = ["tx_id", "amount", "timestamp", "trace_id"]
 ACCESSED_FROM_PROPS = ["session_id", "login_timestamp"]
 USED_DEVICE_PROPS = ["application_version", "binding_flag"]
 SETTLED_AT_PROPS = ["clearing_duration_ms", "terminal_id"]
+OWNS_PROPS: list[str] = []  # structural only -- no PDD-defined properties for this edge
 
 RING_LABEL_COLS_VERTEX = ["provenance", "is_ring_member", "ring_id", "ring_type"]
 RING_LABEL_COLS_EDGE = ["provenance", "is_synthetic", "ring_id", "ring_type"]
@@ -83,6 +87,7 @@ class GraphTables:
     accessed_from: pd.DataFrame
     used_device: pd.DataFrame
     settled_at: pd.DataFrame
+    owns: pd.DataFrame
 
 
 def _sha256(text: str) -> str:
@@ -101,7 +106,7 @@ def derive_account_universe(
 ) -> GraphTables:
     """Derive the background (non-ring) Account/Customer/Device/IPAddress/
     Merchant vertex tables and FUNDS_TRANSFER/ACCESSED_FROM/USED_DEVICE/
-    SETTLED_AT edge tables from real (or bundled-sample) transaction rows.
+    SETTLED_AT/OWNS edge tables from real (or bundled-sample) transaction rows.
 
     `provenance` should be "real_kaggle" or "bundled_sample" and is stamped
     onto every row produced here so downstream EDA can separate real vs.
@@ -281,6 +286,19 @@ def derive_account_universe(
     settled_at["ring_id"] = None
     settled_at["ring_type"] = None
 
+    # OWNS: Customer -> Account, 1:1 for every background account (each has
+    # exactly one owning customer here). See module docstring note 1.
+    owns = pd.DataFrame(
+        {
+            "src_cust_id": accounts["cust_id"],
+            "dst_acct_id": accounts["acct_id"],
+        }
+    )
+    owns["provenance"] = provenance
+    owns["is_synthetic"] = False
+    owns["ring_id"] = None
+    owns["ring_type"] = None
+
     accounts = accounts[ACCOUNT_PROPS + ["cust_id"] + RING_LABEL_COLS_VERTEX]
     customers = customers[CUSTOMER_PROPS + ["provenance"]]
     devices = devices[DEVICE_PROPS + ["provenance"]]
@@ -298,6 +316,7 @@ def derive_account_universe(
     settled_at = settled_at[
         ["src_acct_id", "dst_merch_id"] + SETTLED_AT_PROPS + RING_LABEL_COLS_EDGE
     ]
+    owns = owns[["src_cust_id", "dst_acct_id"] + OWNS_PROPS + RING_LABEL_COLS_EDGE]
 
     return GraphTables(
         accounts=accounts,
@@ -309,4 +328,5 @@ def derive_account_universe(
         accessed_from=accessed_from,
         used_device=used_device,
         settled_at=settled_at,
+        owns=owns,
     )
