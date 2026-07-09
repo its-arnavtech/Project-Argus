@@ -8,8 +8,8 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 0 — Repo bootstrap, context.md engine, README
 - [x] Chunk 1 — Real data acquisition + synthetic ring simulator
 - [x] Chunk 2 — Rust ingestion engine v1 (local)
-- [ ] Chunk 3 — Azure infra via Terraform  ← IN PROGRESS
-- [ ] Chunk 4 — Wire ingestion to real Azure Event Hubs
+- [x] Chunk 3 — Azure infra via Terraform
+- [ ] Chunk 4 — Wire ingestion to real Azure Event Hubs  ← IN PROGRESS
 - [ ] Chunk 5 — Cosmos DB graph schema + loader
 - [ ] Chunk 6 — GNN training pipeline
 - [ ] Chunk 7 — Real-time GNN inference service
@@ -20,8 +20,8 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [ ] Chunk 12 — Docs polish & demo packaging
 
 ## Current State
-- Active chunk: 3
-- Exact next action: run Chunk 3 prompt (Azure infra via Terraform — parameterized tiers per the Chunk 0 decision to scale down PDD's enterprise specs)
+- Active chunk: 4
+- Exact next action: run Chunk 4 prompt (wire ingestion to real Azure Event Hubs — add `EventHubSink` to ingestion/src/lib.rs wrapping azure_messaging_eventhubs, pull the namespace connection string into Key Vault, deploy the ingestion service into the Container Apps environment)
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -100,29 +100,89 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   `competition_download_file` calls for just train_transaction.csv +
   train_identity.csv (~710MB), since we never use the unlabeled test
   files.
+- 2026-07-09 — Chunk 3: real Azure infra provisioned via Terraform, dev
+  tier, into "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID,
+  confirmed with the user as the ~$75 credit grant subscription before
+  touching anything). All resources locked to East US 2: Claude Opus 4.8
+  on Azure AI Foundry (needed in Chunk 8) is only Hosted-on-Azure in East
+  US 2 / Sweden Central, and co-locating everything now avoids cross-
+  region egress charges later.
+- 2026-07-09 — Chunk 3: added a top-level `tier` variable
+  (infra/envs/dev/variables.tf) switching Event Hubs SKU/partitions/
+  retention and Cosmos throughput between "dev" (this build, budget-
+  capped) and "enterprise" (PDD_Production_Guide.md section 2's literal
+  bank-scale spec). Multi-region writes and Cosmos autopilot are captured
+  in the tier map for documentation but not yet wired into modules/
+  cosmos_db (single-region/manual-throughput only) -- real module
+  behavior changes, deferred to whichever chunk actually runs at
+  "enterprise" tier rather than built speculatively now. This is the
+  variable that makes the scale-down (logged in the first entry above)
+  concrete and reversible in one change.
+- 2026-07-09 — Chunk 3: added an azurerm_consumption_budget_resource_group
+  scoped to rg-argus-dev, $75/month, alert notifications at 50/75/90% of
+  budget to redacted@example.com -- a hard ceiling on real spend
+  while iterating, not just documentation of intent.
+- 2026-07-09 — Chunk 3: verified all Terraform resource schemas against
+  the live hashicorp/azurerm v4.80.0 provider docs (fetched from the
+  provider's GitHub source, since the Terraform Registry site itself is
+  JS-rendered and unfetchable) rather than relying on training-data
+  memory, given real budget was on the line. Caught two v4 renames that
+  would have failed apply: Cosmos free tier is `free_tier_enabled` (not
+  `enable_free_tier`), Key Vault RBAC is `rbac_authorization_enabled` (not
+  `enable_rbac_authorization`).
+- 2026-07-09 — Chunk 3: first `terraform apply` failed on the Container
+  Apps Environment with `MissingSubscriptionRegistration` for
+  `Microsoft.App` -- this subscription had never used Container Apps
+  before. Registered the resource provider (one-time, non-destructive)
+  and re-planned/re-applied; the second plan showed exactly the one
+  remaining resource, reviewed and approved before applying, consistent
+  with the "always show plan, never blind-apply" rule for this chunk.
+- 2026-07-09 — Incidental (discovered via `git status` at the start of
+  this session, not something this session did): between the Chunk 2 and
+  Chunk 3 sessions, the real IEEE-CIS dataset was pulled (competition
+  rules evidently accepted) and Chunk 1's ring_injector.py/eda_report.py
+  were rerun against it -- 590,540 real transactions, 40,289 accounts (315
+  ring members, 0.78%). This resolved the "bundled sample, not real data"
+  Known Issue below. It left one inconsistency: Chunk 2's
+  funds_transfer_raw.jsonl export predated that refresh and still
+  reflected the old bundled-sample data. Reran
+  data/scripts/export_ingestion_jsonl.py (590,860 rows) and re-verified
+  the Rust ingestion engine against the full real corpus: 590,860 events
+  drained in ~64s (~9,200 events/sec, LocalFileSink release build) with no
+  errors -- consistent with Chunk 2's synthetic-load throughput numbers.
 
 ## Environment & Resource Reference
-(none provisioned yet — filled in starting Chunk 3)
+
+Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed with the user 2026-07-09 as the ~$75 credit grant subscription. Region: East US 2 (eastus2) for all resources. Provisioned via infra/envs/dev (tier=dev):
+
+- Resource group: `rg-argus-dev`
+- Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention)
+- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 400 RU/s; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`) -- Chunk 5 creates the actual graph/container
+- Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- empty, no secrets yet (Chunk 4/10)
+- Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (Chunk 4)
+- Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to redacted@example.com
+
+Connection strings, keys, and the random suffix's source are in Terraform state (`infra/envs/dev/terraform.tfstate`, gitignored) -- never in this file.
 
 ## Known Issues / TODO
-- `data/raw/` still holds the generated bundled sample (15,000 background
-  transactions), not the real IEEE-CIS dataset. Update: Kaggle credentials
-  now work (`python -m kaggle` is authenticated — note the `kaggle` command
-  itself isn't on PATH yet, use `python -m kaggle ...`), but the real
-  download 403s with "Forbidden" because this Kaggle account hasn't
-  accepted the ieee-fraud-detection competition rules yet. That's a
-  one-time manual step only doable in a browser:
-  https://www.kaggle.com/competitions/ieee-fraud-detection/rules — after
-  accepting, rerun `data/scripts/acquire_ieee_cis.py`, then
-  `ring_injector.py` and `eda_report.py` to regenerate `data/simulated/`
-  and the ingestion JSONL export against real data.
-- Bundled sample's device diversity is low (6 unique DeviceInfo strings) —
-  a known limitation of the fallback generator, not the real dataset.
-- Ingestion throughput (LocalFileSink, this dev machine): ~11,300
-  events/sec release / ~7,300 events/sec debug — directional toward the
-  PDD's 15,000 events/sec target, not yet at it. Expected to improve with
-  the real `azure_messaging_eventhubs` async client in Chunk 4 and formal
-  load testing in Chunk 11; not a gate for this chunk.
+- RESOLVED 2026-07-09: `data/raw/` now holds the real IEEE-CIS dataset
+  (590,540 transactions) — Kaggle competition rules were accepted and
+  `data/scripts/acquire_ieee_cis.py`/`ring_injector.py`/`eda_report.py`
+  reran against it. Note the `kaggle` command still isn't on PATH on this
+  machine — use `python -m kaggle ...`.
+- Real dataset's device diversity is much higher than the old bundled
+  sample (1,786 unique devices vs. 6), as expected.
+- Ingestion throughput (LocalFileSink, this dev machine): ~9,200-11,300
+  events/sec across synthetic-load and real-590K-row runs — directional
+  toward the PDD's 15,000 events/sec target, not yet at it. Expected to
+  improve with the real `azure_messaging_eventhubs` async client in
+  Chunk 4 and formal load testing in Chunk 11; not a gate for either
+  chunk.
+- Azure resource providers may need one-time registration on first use in
+  a fresh subscription (hit this with `Microsoft.App` in Chunk 3) — if a
+  future chunk's `terraform apply` fails with
+  `MissingSubscriptionRegistration`, run
+  `az provider register -n <Namespace>` and re-plan/re-apply.
 - No ML/agent code yet.
 
 ## File Map
@@ -132,7 +192,7 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - `ml/` — `training/`, `inference/` scaffolded, empty
 - `agents/` — scaffolded, empty (LangGraph compliance loop lands Chunk 8)
 - `graph/` — scaffolded, empty (Cosmos DB schema + loader lands Chunk 5)
-- `infra/` — `modules/`, `envs/` scaffolded, empty (Terraform lands Chunk 3)
+- `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure as of Chunk 3 (see Environment & Resource Reference)
 - `dashboards/` — scaffolded, empty (Tableau lands Chunk 9)
 - `tests/` — `unit/`, `integration/`, `load/` scaffolded, empty
 - `.github/workflows/` — scaffolded, empty (CI lands later chunks)
@@ -170,5 +230,25 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   scope (was pulling ~1.3GB of unneeded test files); real download still
   blocked by a 403 because this Kaggle account hasn't accepted the
   competition rules yet (manual browser step, logged above).
+- 2026-07-09 — Claude Code — Chunk 3 — real Azure infra via Terraform.
+  Confirmed subscription (Azure subscription 1) and budget alert email
+  with the user before writing anything. Verified all resource schemas
+  against live azurerm v4.80.0 docs first (real budget on the line),
+  which caught two v4 attribute renames that would have broken apply.
+  Wrote 5 modules (event_hubs, cosmos_db, container_apps, key_vault,
+  budget_alert) + envs/dev wiring them with a tier "dev"/"enterprise"
+  switch. Ran init/validate/plan, printed the full plan, and stopped for
+  explicit go-ahead before applying (per the standing rule for this
+  chunk). First apply hit MissingSubscriptionRegistration for
+  Microsoft.App (never used Container Apps on this subscription before);
+  registered the provider, re-planned (1 resource remaining), got
+  re-approval, applied. All 11 resources live: rg-argus-dev,
+  evhns-argus-dev-to614f, cosmos-argus-dev-to614f, kv-argus-dev-to614f,
+  argus-dev-cae, argus-dev-budget. Incidentally discovered (via git
+  status, not done by this session) that the real IEEE-CIS dataset had
+  been pulled since Chunk 2 — refreshed the now-stale ingestion JSONL
+  export and re-verified the Rust engine against the full 590,860-row
+  real corpus (~9,200 events/sec, no errors). README Data Sources and
+  Chunk 1 EDA doc now reflect real numbers throughout.
 
 Last updated: 2026-07-09 by Claude Code
