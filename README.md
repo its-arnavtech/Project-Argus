@@ -88,7 +88,9 @@ This is an active build. Roadmap and progress are tracked in [context.md](contex
 
 ## Data Sources
 
-Real dataset: IEEE-CIS Fraud Detection dataset, layered with a synthetic ring-injection simulator to generate labeled circular-transfer and mule-ring patterns. Acquisition and simulation details land in Chunk 1 (`data/scripts/`).
+Real dataset: [IEEE-CIS Fraud Detection](https://www.kaggle.com/c/ieee-fraud-detection) (Kaggle competition, ~590K labeled card-not-present transactions), pulled via `data/scripts/acquire_ieee_cis.py` using the Kaggle API. If Kaggle credentials aren't configured, the script prints exact setup steps and falls back to a small schema-compatible bundled sample so the rest of the pipeline is never blocked — the current `data/raw/` snapshot is the bundled sample (15,000 background transactions), since this dev machine has no Kaggle credentials yet.
+
+No public dataset labels multi-hop fraud syndicates — IEEE-CIS labels individual-transaction card fraud, not the ring/mule-network structures Argus's GNN needs. `data/scripts/ring_injector.py` builds an account universe from the real (or bundled) transaction data, matching the exact vertex/edge schema in [docs/specs/PDD_Production_Guide.md](docs/specs/PDD_Production_Guide.md) section 1, then injects three labeled ring archetypes on top: circular transfer chains, smurfing fan-in/fan-out, and shared-device clusters. Current run: **14,912 accounts** (315 ring members, 2.11%), **45 injected rings** (20 circular, 15 smurfing, 10 device-cluster). Full stats: [docs/architecture/chunk1_data_eda_summary.md](docs/architecture/chunk1_data_eda_summary.md).
 
 ## License
 
