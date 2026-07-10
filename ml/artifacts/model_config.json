@@ -1,0 +1,26 @@
+{
+  "architecture": "InstitutionalFraudSAGE",
+  "in_channels": 4,
+  "hidden_channels": 64,
+  "out_channels": 2,
+  "aggr": "max",
+  "dropout": 0.2,
+  "feature_names": [
+    "tx_count",
+    "unique_counterparties",
+    "value_variance",
+    "device_assoc_count"
+  ],
+  "best_epoch": 5,
+  "test_metrics": {
+    "precision": 1.0,
+    "recall": 0.8235294117647058,
+    "f1": 0.9032258064516129,
+    "pr_auc": 0.9965789357472502,
+    "fp_rate": 0.0,
+    "tp": 42,
+    "fp": 0,
+    "fn": 9,
+    "tn": 7996
+  }
+}

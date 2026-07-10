@@ -11,8 +11,8 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 3 — Azure infra via Terraform
 - [x] Chunk 4 — Wire ingestion to real Azure Event Hubs
 - [x] Chunk 5 — Cosmos DB graph schema + loader
-- [ ] Chunk 6 — GNN training pipeline  ← IN PROGRESS
-- [ ] Chunk 7 — Real-time GNN inference service
+- [x] Chunk 6 — GNN training pipeline
+- [ ] Chunk 7 — Real-time GNN inference service  ← IN PROGRESS
 - [ ] Chunk 8 — LangGraph agentic compliance loop
 - [ ] Chunk 9 — Tableau dashboard
 - [ ] Chunk 10 — Production hardening
@@ -20,11 +20,11 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [ ] Chunk 12 — Docs polish & demo packaging
 
 ## Current State
-- Active chunk: 6
-- Exact next action: run the GNN training pipeline (ml/training/train_gnn.py
-  — features + graph construction written, waiting on the local torch
-  install to finish), then honest evaluation and artifact export for
-  Chunk 7.
+- Active chunk: 7
+- Exact next action: run the real-time inference service end-to-end
+  (ml/inference/ — service code written: prepare_validation_events.py →
+  Rust binary sends events → inference_service.py consumes, scores,
+  writes gnn_risk_score to Cosmos → post-run sanity validation).
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -255,6 +255,44 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   1000 RU/s pool. FUNDS_TRANSFER edges require both endpoints selected.
   Full-scale load is Chunk 11's job. Edges carry no partitionKey property
   themselves -- Cosmos co-locates an edge with its source vertex.
+- 2026-07-09 — Chunk 6: node features are exactly POC_Blueprint.md section
+  3's four (tx_count, unique_counterparties, value_variance,
+  device_assoc_count), computed as real per-account aggregates over the
+  full 590K-row corpus. LEAKAGE GUARD: `risk_base` is deliberately NOT a
+  feature -- graph_schema.py derives it partly from the isFraud label, so
+  using it would leak target signal; all four features are purely
+  behavioral. Message-passing graph is homogeneous Account-only:
+  FUNDS_TRANSFER edges both directions, plus pairwise shared-Device and
+  shared-IP edges capped at devices/IPs shared by <=10 accounts -- IEEE-CIS
+  DeviceInfo strings are coarse ("Windows" = one hash shared by thousands;
+  pairwise-connecting those would add millions of meaningless edges, and a
+  device shared by 5,000 accounts is an OS string, not a hardware
+  fingerprint). Result: 40,289 nodes, 2,682,934 directed edges.
+- 2026-07-09 — Chunk 6: train/val/test split holds out ENTIRE RINGS --
+  rings sharing members (device_cluster reuse) are first merged into
+  components via union-find, and components get split 60/20/20 (205/59/51
+  positives). Splitting individual nodes within a ring would leak
+  structural signal from train-set neighbors into test predictions via
+  GraphSAGE aggregation. Class imbalance (~0.78% positive): inverse-
+  frequency weighted NLL loss (weight ~117:1) -- chosen over resampling
+  because transductive full-graph training has no natural minibatch to
+  resample, and discarding legit nodes would starve the negative class of
+  the diversity the FP-rate target depends on. Model selection by best
+  val PR-AUC with early stopping (best at epoch 5; training past ~epoch 20
+  degraded val PR-AUC).
+- 2026-07-09 — Chunk 6 environment fixes worth knowing about: (1) global
+  pip torch install fails on this machine -- Microsoft Store Python's deep
+  site-packages path + torch 2.13's nested license dirs exceed Windows
+  MAX_PATH. ML stack lives in `.venv` at the repo root
+  (--system-site-packages); use `.venv/Scripts/python.exe` for anything
+  importing torch. The half-installed global torch was left broken
+  ("torch None" in pip list) -- harmless, shadowed by the venv copy.
+  (2) MLflow 3.14 hard-deprecated the ./mlruns filesystem backend --
+  tracking uses sqlite:///ml/training/mlflow.db (gitignored). (3)
+  mlflow.pytorch.log_model defaults to 'pt2' traced-graph serialization
+  requiring an input example -- brittle for dynamic-graph GNNs, so the
+  model is logged as plain artifacts (state_dict + config + feature
+  stats), which is what Chunk 7 loads anyway.
 
 ## Environment & Resource Reference
 
@@ -299,7 +337,7 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
 - `docs/` — `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` holds chunk1_data_eda_summary.md and partition_key_strategy.md (Gremlin partition key + indexing policy reasoning)
 - `data/` — `scripts/` holds `graph_schema.py` (shared vertex/edge schema + real-data derivation), `acquire_ieee_cis.py` (Kaggle acquisition + bundled-sample fallback), `ring_injector.py` (synthetic ring injection), `eda_report.py` (validation/EDA); `raw/` and `simulated/` are gitignored but currently populated (bundled sample + 45 injected rings) — regenerate anytime via the three scripts in order
 - `ingestion/` — real Cargo crate: `src/lib.rs` (RawTransaction/EnrichedTransaction, `Sink` trait, `LocalFileSink`/`StdoutSink`, SHA-256 PII masking, 8 passing unit/integration tests), `src/event_hub_sink.rs` (`EventHubSink` -- Azure AD auth via `DeveloperToolsCredential`, retry w/ backoff), `src/main.rs` (binary entrypoint; `ARGUS_SINK=eventhub` targets real Event Hubs, `ARGUS_EVENT_LIMIT` caps volume), `examples/eventhub_validate.rs` (send+read-back round-trip check); Chunk 5 is next
-- `ml/` — `training/`, `inference/` scaffolded, empty
+- `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction) and `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- Chunk 7 loads these); `inference/` holds `inference_service.py` + `prepare_validation_events.py` (Chunk 7, in progress). NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
 - `agents/` — scaffolded, empty (LangGraph compliance loop lands Chunk 8)
 - `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation, `--validate` for checks only) + `requirements.txt` (gremlinpython)
 - `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
@@ -411,5 +449,20 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   Device AND via shared IP each reached its 4 fellow device_cluster ring
   members — PASS; (b) Customer->OWNS->Account resolves (1,538 OWNS edges,
   sample CUST-000047->ACC-000047) — PASS.
+- 2026-07-09 — Claude Code — Chunk 6 — GNN training pipeline on the full
+  real corpus (40,289 nodes / 2.68M directed edges incl. capped
+  shared-device/IP edges). InstitutionalFraudSAGE per POC section 3
+  (2-layer SAGEConv max-aggr, hidden 64), weighted NLL (~117:1),
+  ring-component 60/20/20 holdout, MLflow (sqlite) tracked, early stop
+  (best val PR-AUC 0.997 @ epoch 5). TEST (held-out rings, 51 positives):
+  precision 1.000, recall 0.824 (42 TP / 9 FN), F1 0.903, PR-AUC 0.997,
+  FP-rate 0.000 (0 FP / 7,996 TN). Honesty: NOT a hollow result -- FP-rate
+  meets the PDD <2.5% target while recall stays at 82.4%, so the model is
+  genuinely catching held-out rings, not under-flagging. Big caveat: the
+  positives are synthetic rings that are structurally conspicuous by
+  construction; these numbers validate the pipeline, they do NOT claim
+  real-world-fraud performance. Artifacts exported to ml/artifacts/ for
+  Chunk 7. Environment: ML runs via repo .venv (Windows MAX_PATH broke
+  global torch), MLflow on sqlite (filesystem backend deprecated in 3.14).
 
 Last updated: 2026-07-09 by Claude Code

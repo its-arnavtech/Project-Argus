@@ -24,6 +24,10 @@ data/raw/*
 data/simulated/*
 !data/simulated/.gitkeep
 
+# MLflow local tracking store
+mlruns/
+mlflow.db
+
 # Secrets
 .env
 .env.*
