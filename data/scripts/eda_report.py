@@ -31,6 +31,7 @@ def load_tables() -> dict[str, pd.DataFrame]:
         "accessed_from": "edges_accessed_from.parquet",
         "used_device": "edges_used_device.parquet",
         "settled_at": "edges_settled_at.parquet",
+        "owns": "edges_owns.parquet",
         "rings_manifest": "rings_manifest.parquet",
     }
     return {name: pd.read_parquet(SIM_DIR / fname) for name, fname in files.items()}

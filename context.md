@@ -10,8 +10,8 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 2 — Rust ingestion engine v1 (local)
 - [x] Chunk 3 — Azure infra via Terraform
 - [x] Chunk 4 — Wire ingestion to real Azure Event Hubs
-- [ ] Chunk 5 — Cosmos DB graph schema + loader  ← IN PROGRESS
-- [ ] Chunk 6 — GNN training pipeline
+- [x] Chunk 5 — Cosmos DB graph schema + loader
+- [ ] Chunk 6 — GNN training pipeline  ← IN PROGRESS
 - [ ] Chunk 7 — Real-time GNN inference service
 - [ ] Chunk 8 — LangGraph agentic compliance loop
 - [ ] Chunk 9 — Tableau dashboard
@@ -20,16 +20,11 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [ ] Chunk 12 — Docs polish & demo packaging
 
 ## Current State
-- Active chunk: 5 (prep work done, not complete)
-- Exact next action: build the Chunk 5 loader — the Gremlin graph container
-  (`argus-graph-container`) now exists with its partition key and indexing
-  policy resolved (see Architectural Decisions Log and
-  docs/architecture/partition_key_strategy.md), and `graph_schema.py` now
-  defines the OWNS edge. Still needed: the actual loader that reads
-  data/simulated/*.parquet, stamps a `partitionKey` value onto every
-  vertex/edge (per the partition key strategy doc), and writes them into
-  `argus-graph-container` via the Gremlin API; then traversal validation
-  against the loaded graph.
+- Active chunk: 6
+- Exact next action: run the GNN training pipeline (ml/training/train_gnn.py
+  — features + graph construction written, waiting on the local torch
+  install to finish), then honest evaluation and artifact export for
+  Chunk 7.
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -239,6 +234,27 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   their Customer records exist but aren't edge-linked. Data not
   regenerated in this session (this is schema/infra prep, not a pipeline
   rerun); takes effect next time `ring_injector.py` actually runs.
+- 2026-07-09 — Chunk 5: gremlinpython API constraints confirmed against
+  Microsoft Learn docs before writing the loader (same discipline as
+  Chunk 4's Rust crate checks): Cosmos Gremlin supports NO bytecode (string
+  queries via client.submit() + bindings only), requires the GraphSON v2
+  serializer (GraphSONSerializersV2d0 -- v3 unsupported), rejects null
+  property values (loader skips None/NaN per row), and has NO native AAD
+  data-plane auth -- username is /dbs/{db}/colls/{graph}, password is the
+  account key. The key is fetched at runtime via `az cosmosdb keys list`
+  (or ARGUS_COSMOS_KEY env var), never hardcoded or committed. Note:
+  Microsoft's compatibility table recommends the 3.4.13 driver and flags
+  3.5/3.6 issues; gremlinpython 3.8.1 was verified working against the
+  live container (connectivity, writes, traversals) before the bulk load.
+- 2026-07-09 — Chunk 5: loader loads a representative SUBSET (~5.4K
+  vertices / ~6.9K edges), not the full ~590K corpus: all 315 ring
+  accounts + their ring-edge counterparties + 1,500 sampled legit accounts.
+  Ring members keep ALL their ACCESSED_FROM/USED_DEVICE/SETTLED_AT edges
+  (shared-device/IP structure IS the fraud signal); legit accounts keep one
+  of each, enough to be realistically connected without blowing the shared
+  1000 RU/s pool. FUNDS_TRANSFER edges require both endpoints selected.
+  Full-scale load is Chunk 11's job. Edges carry no partitionKey property
+  themselves -- Cosmos co-locates an edge with its source vertex.
 
 ## Environment & Resource Reference
 
@@ -246,7 +262,7 @@ Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed
 
 - Resource group: `rg-argus-dev`
 - Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
-- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (no dedicated throughput -- 1st of 25 free-tier containers, still $0) -- loader (Chunk 5 proper) still ahead
+- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (still $0). LOADED as of Chunk 5: 5,387 vertices (1,853 Account / 1,853 Customer / 102 Device / 1,530 IPAddress / 49 Merchant) + 6,867 edges (1,380 FT / 1,580 AF / 831 UD / 1,538 SA / 1,538 OWNS) -- the representative subset, not the full corpus
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- still empty; Chunk 4 authenticated to Event Hubs via Azure AD/RBAC instead of a connection string, so no secret was needed here yet. Chunk 10 will use it for whatever genuinely needs a stored secret in production.
 - Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (still pending; not this chunk's scope either)
 - Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to redacted@example.com
@@ -285,7 +301,7 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
 - `ingestion/` — real Cargo crate: `src/lib.rs` (RawTransaction/EnrichedTransaction, `Sink` trait, `LocalFileSink`/`StdoutSink`, SHA-256 PII masking, 8 passing unit/integration tests), `src/event_hub_sink.rs` (`EventHubSink` -- Azure AD auth via `DeveloperToolsCredential`, retry w/ backoff), `src/main.rs` (binary entrypoint; `ARGUS_SINK=eventhub` targets real Event Hubs, `ARGUS_EVENT_LIMIT` caps volume), `examples/eventhub_validate.rs` (send+read-back round-trip check); Chunk 5 is next
 - `ml/` — `training/`, `inference/` scaffolded, empty
 - `agents/` — scaffolded, empty (LangGraph compliance loop lands Chunk 8)
-- `graph/` — scaffolded, empty (Cosmos DB schema + loader lands Chunk 5)
+- `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation, `--validate` for checks only) + `requirements.txt` (gremlinpython)
 - `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
 - `dashboards/` — scaffolded, empty (Tableau lands Chunk 9)
 - `tests/` — `unit/`, `integration/`, `load/` scaffolded, empty
@@ -379,5 +395,21 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   deviation from the PDD's literal 4-edge list, resolving Chunk 1's
   deferred question about `cust_id`. Code only; data/simulated/ not
   regenerated this session.
+- 2026-07-09 — Claude Code — Chunk 5 — Cosmos Gremlin loader + traversal
+  validation. Reran ring_injector/eda_report/export so data/simulated/
+  includes edges_owns.parquet (39,974 OWNS rows; also added owns to
+  eda_report.py's table list, which the prep session missed). Confirmed
+  Cosmos Gremlin constraints against Microsoft docs (no bytecode, GraphSON
+  v2 only, no null props, key-based auth only), verified gremlinpython
+  3.8.1 against the live container despite Microsoft's table recommending
+  3.4.13. graph/loader.py loaded the representative subset in 720s:
+  5,387 vertices (1,853 Account incl. all 315 ring members, 1,853
+  Customer, 102 Device, 1,530 IPAddress, 49 Merchant) + 6,867 edges
+  (1,380 FUNDS_TRANSFER, 1,580 ACCESSED_FROM, 831 USED_DEVICE, 1,538
+  SETTLED_AT, 1,538 OWNS), with 429-throttling retry. Traversal
+  validation: (a) multi-hop from ring member ACC-R00295 via shared
+  Device AND via shared IP each reached its 4 fellow device_cluster ring
+  members — PASS; (b) Customer->OWNS->Account resolves (1,538 OWNS edges,
+  sample CUST-000047->ACC-000047) — PASS.
 
 Last updated: 2026-07-09 by Claude Code
