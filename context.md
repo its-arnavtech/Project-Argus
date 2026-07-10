@@ -14,17 +14,17 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 6 — GNN training pipeline
 - [x] Chunk 7 — Real-time GNN inference service
 - [x] Chunk 8 — LangGraph agentic compliance loop
-- [ ] Chunk 9 — Tableau dashboard  ← IN PROGRESS
-- [ ] Chunk 10 — Production hardening
+- [x] Chunk 9 — Tableau dashboard
+- [ ] Chunk 10 — Production hardening  ← IN PROGRESS
 - [ ] Chunk 11 — Load testing & SLO validation
 - [ ] Chunk 12 — Docs polish & demo packaging
 
 ## Current State
-- Active chunk: 9
-- Exact next action: Tableau analytics layer — Python export job flattening
-  Gremlin + transaction data into a single extract (stands in for the PDD's
-  Synapse-Link/15-min-refresh enterprise path), then a hand-authored .twb
-  implementing PDD section 3's three calculated fields against that extract.
+- Active chunk: 10
+- Exact next action: run Chunk 10 prompt (production hardening — managed
+  identities replacing the dev-only RBAC bridges, Key Vault-backed PII
+  salt, ingestion container deployment into argus-dev-cae, resilience
+  patterns deferred from Chunk 4).
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -430,6 +430,32 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   scope-down as the partition-key and Tableau-extract decisions. The
   enterprise path (SQL Warehouse for SAR archives + audit trail) remains a
   Terraform module away if ever needed.
+- 2026-07-10 — Chunk 9: Tableau connects to a FLATTENED FILE EXTRACT, not
+  the live graph. Tableau can't query Gremlin natively; the enterprise
+  path is Cosmos Analytical Store + Synapse Link (Tableau's Synapse
+  connector reading the auto-synced columnar store on the PDD's 15-minute
+  refresh), which isn't budget-justified here (Synapse workspace + storage
+  for a demo). dashboards/export_tableau_extract.py runs the real Gremlin
+  queries (scored accounts + SAR flags from Cosmos) plus transaction-level
+  computation (per-transfer 60s velocity_score_1m via two-pointer scan;
+  hop_distance via multi-source BFS from all 158 flagged accounts over the
+  undirected FUNDS_TRANSFER graph) and writes one 590,860-row extract
+  (CSV for the .twb + parquet twin, both gitignored). Re-running the job
+  is the "refresh". Enterprise migration path: set analytical_storage_ttl
+  on the container, add Synapse Link, repoint the workbook's connection --
+  the calculated fields wouldn't change.
+- 2026-07-10 — Chunk 9 SPEC CORRECTION: PDD section 3's Syndicate Cascade
+  Index formula (`COUNTD([tx_id]) * SUM([amount]) * AVG([velocity_score_1m])
+  * IF [proxy_flag] THEN 1.5 ELSE 1.0 END`) mixes aggregates with a
+  row-level [proxy_flag] -- Tableau rejects that ("cannot mix aggregate and
+  non-aggregate arguments"). Implemented as `IF MAX([proxy_flag]) THEN 1.5
+  ELSE 1.0 END`, the minimal correction preserving the intent (any proxy
+  exposure in scope applies the 1.5x multiplier). The other two fields
+  (Multi-Hop Risk Dispersion Factor, Device Sharing Density Ratio) are
+  verbatim. Caveat noted in the workbook itself: hand-authored XML,
+  structure/fields verified (well-formed, correct formulas), but visual
+  rendering needs a check in actual Tableau Desktop, which this
+  environment doesn't have.
 
 ## Environment & Resource Reference
 
@@ -502,7 +528,7 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
 - `agents/` — `compliance_graph.py` (real LangGraph StateGraph: NetworkTracer w/ live Gremlin traversals, BehavioralAnalyst w/ real transaction metrics, SARGenerator w/ real Foundry LLM call, groundedness guardrail w/ conditional retry edge), `orchestrator.py` (Cosmos cross-query discovery of flagged accounts -> pipeline -> SAR stored on vertex), `requirements.txt`. Runs on global Python (no torch needed)
 - `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation; `--validate` for checks only, `--add-ring-owns` for the targeted OWNS-edge fix; auth via `DefaultAzureCredential` + Gremlin RBAC, no account key) + `requirements.txt` (gremlinpython, azure-identity)
 - `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
-- `dashboards/` — scaffolded, empty (Tableau lands Chunk 9)
+- `dashboards/` — `export_tableau_extract.py` (Gremlin + transaction queries flattened to `extracts/argus_tableau_extract.csv|parquet`, gitignored; rerun = refresh), `argus_fraud_dashboard.twb` (hand-authored workbook, three PDD section 3 calculated fields, needs visual check in Tableau Desktop)
 - `tests/` — `unit/`, `integration/`, `load/` scaffolded, empty
 - `.github/workflows/` — scaffolded, empty (CI lands later chunks)
 - Root — `README.md`, `LICENSE` (MIT), `.gitignore`, `context.md` (this file)
@@ -682,5 +708,16 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   1.0), 6 SAR drafts generated, 6/6 passed groundedness on first attempt
   (0 regenerations), all 6 stored on their Account vertices (sar_draft/
   sar_generated_at/sar_grounded/sar_model). Total LLM cost: ~$0.02.
+- 2026-07-10 — Claude Code — Chunk 9 — Tableau analytics layer via
+  flattened extract. dashboards/export_tableau_extract.py: real Gremlin
+  queries (475 scored accounts, 158 flagged, 6 grounded SARs) + full-corpus
+  transaction computation (per-transfer 60s velocity, multi-source-BFS
+  hop_distance from all flagged accounts) -> 590,860-row extract in 7s
+  (CSV + parquet, gitignored). argus_fraud_dashboard.twb implements PDD
+  section 3's three calculated fields (Syndicate Cascade Index with the
+  MAX([proxy_flag]) spec correction -- the PDD formula is invalid Tableau
+  as written; the other two verbatim) over that extract, one worksheet per
+  field. XML validated well-formed; visual layout still needs a Tableau
+  Desktop check (not available in this environment).
 
 Last updated: 2026-07-10 by Claude Code

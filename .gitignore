@@ -23,6 +23,7 @@ data/raw/*
 !data/raw/.gitkeep
 data/simulated/*
 !data/simulated/.gitkeep
+dashboards/extracts/
 
 # MLflow local tracking store
 mlruns/
