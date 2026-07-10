@@ -10,12 +10,24 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.6"
     }
+    # Added in Chunk 8 for the Foundry/Claude deployment -- azurerm can't
+    # express modelProviderData or allowProjectManagement (see
+    # modules/foundry_claude/main.tf). Deliberate new dependency, approved
+    # with the Chunk 8 deployment plan.
+    azapi = {
+      source  = "Azure/azapi"
+      version = "~> 2.0"
+    }
   }
 }
 
 provider "azurerm" {
   subscription_id = var.subscription_id
   features {}
+}
+
+provider "azapi" {
+  subscription_id = var.subscription_id
 }
 
 data "azurerm_client_config" "current" {}
@@ -105,6 +117,31 @@ resource "azurerm_role_assignment" "dev_eventhub_sender" {
   scope                = module.event_hubs.namespace_id
   role_definition_name = "Azure Event Hubs Data Sender"
   principal_id         = data.azurerm_client_config.current.object_id
+}
+
+# Chunk 8: Foundry account + gpt-5-mini deployment for the LangGraph
+# compliance agents' SAR generation. Pure PAYG token billing, $0 idle.
+# Originally targeted Claude Opus 4.8 -- blocked by a subscription-level
+# 0-TPM quota on all Claude models; gpt-5-mini fallback user-approved.
+# See modules/foundry_llm/main.tf for the full history.
+module "foundry_llm" {
+  source = "../../modules/foundry_llm"
+
+  account_name      = "argus-${var.tier}-foundry-${random_string.suffix.result}"
+  project_name      = "argus-${var.tier}-proj"
+  deployment_name   = "gpt-5-mini-argus"
+  resource_group_id = azurerm_resource_group.this.id
+  location          = azurerm_resource_group.this.location
+  principal_id      = data.azurerm_client_config.current.object_id
+
+  tags = local.common_tags
+}
+
+# The account/project/RBAC were created under the old module name before the
+# Claude->gpt-5-mini switch; keep their state instead of destroy/recreate.
+moved {
+  from = module.foundry_claude
+  to   = module.foundry_llm
 }
 
 # Chunk 4 validation needs to read events back to confirm delivery (not just

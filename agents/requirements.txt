@@ -1,0 +1,7 @@
+# agents layer -- LangGraph compliance loop (no torch needed; runs on global Python)
+langgraph>=0.2
+openai>=1.50
+azure-identity>=1.15
+gremlinpython>=3.8
+pandas>=2.0
+pyarrow>=14.0

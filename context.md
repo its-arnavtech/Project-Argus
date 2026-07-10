@@ -13,21 +13,18 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 5 — Cosmos DB graph schema + loader
 - [x] Chunk 6 — GNN training pipeline
 - [x] Chunk 7 — Real-time GNN inference service
-- [ ] Chunk 8 — LangGraph agentic compliance loop  ← IN PROGRESS
-- [ ] Chunk 9 — Tableau dashboard
+- [x] Chunk 8 — LangGraph agentic compliance loop
+- [ ] Chunk 9 — Tableau dashboard  ← IN PROGRESS
 - [ ] Chunk 10 — Production hardening
 - [ ] Chunk 11 — Load testing & SLO validation
 - [ ] Chunk 12 — Docs polish & demo packaging
 
 ## Current State
-- Active chunk: 8
-- Exact next action: run Chunk 8 prompt (LangGraph agentic compliance loop
-  — Network Tracer / Behavioral Analyst / SAR Generator agents per POC
-  section 4; discovers flagged nodes by querying Cosmos directly with
-  g.V().has('gnn_risk_score', gt(threshold)), NOT via a separate messaging
-  channel — that decision is logged below. Azure AI Foundry / Claude
-  deployment provisioning belongs to this chunk and needs user approval
-  before creating any billable resource).
+- Active chunk: 9
+- Exact next action: Tableau analytics layer — Python export job flattening
+  Gremlin + transaction data into a single extract (stands in for the PDD's
+  Synapse-Link/15-min-refresh enterprise path), then a hand-authored .twb
+  implementing PDD section 3's three calculated fields against that extract.
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -383,6 +380,56 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   is ever destroyed/recreated via Terraform, this role assignment won't
   come back automatically -- rerun the `az cosmosdb gremlin role
   assignment create` command logged above (or formalize via `azapi` first).
+- 2026-07-10 — Chunk 8: Foundry/LLM deployment saga, in order. (1) Verified
+  the current mechanism for Claude "Hosted on Azure": azurerm CANNOT express
+  it (azurerm_cognitive_deployment lacks `modelProviderData`, issue #31140;
+  azurerm_cognitive_account lacks `allowProjectManagement`) -- the official
+  Azure-Samples/claude starter kit uses azapi, so the azapi provider (~>2.0)
+  was added to our Terraform, approved as part of the deployment plan.
+  (2) The approved plan (claude-opus-4-8 version 2 "Hosted on Azure",
+  GlobalStandard, East US 2, $5/$25 per MTok via Marketplace CCU billing,
+  with the explicit caveat that Marketplace charges hit the payment card,
+  not Azure credits) FAILED at the deployment step: InsufficientQuota, and
+  `az cognitiveservices usage list` confirmed EVERY Claude model has a hard
+  0-TPM quota limit on this subscription -- the credit-grant subscription
+  classification Microsoft's docs warn about. Subscription-level; no
+  capacity value or Claude model swap fixes it; remedy is a Microsoft quota
+  request form with uncertain outcome for credit subscriptions. (3) With
+  explicit user approval, switched to gpt-5-mini (Azure OpenAI first-party):
+  500K TPM quota available, native azurerm_cognitive_deployment, bills as
+  NORMAL Azure consumption (draws from the $75 credit AND falls under the
+  rg budget alert, unlike the Marketplace path), same Entra ID auth, and
+  arguably closer to the PDD's literal "Azure OpenAI via Foundry" wording.
+  Found empirically: the deployment 400s (DeploymentModelNotSupported) if
+  `version` is omitted -- pinned to 2025-08-07. The Foundry account
+  (argus-dev-foundry-to614f), project, and Cognitive Services User role
+  assignment from the original attempt were kept (all $0 idle) -- the
+  account hosts OpenAI deployments identically. Module renamed
+  foundry_claude -> foundry_llm with a terraform `moved` block (3 resources
+  kept in state, zero destroyed). Smoke-tested end-to-end with
+  DefaultAzureCredential (scope https://cognitiveservices.azure.com/.default,
+  endpoint https://<account>.services.ai.azure.com/openai/v1/): PASS.
+- 2026-07-10 — Chunk 8: groundedness guardrail design (mandatory, per this
+  chunk's requirements -- a compliance report that invents a detail is a
+  real failure mode). Deterministic post-generation validation, not
+  LLM-self-grading: (a) every entity matching ACC-*/CUST-*/DEV-*/IPv4
+  patterns in the draft must appear in the serialized evidence bundle;
+  (b) every number in the draft must match an evidence number exactly or be
+  a faithful rounding/percentage form of one (list-enumeration prefixes
+  exempt); violations => draft marked ungrounded, ONE regeneration with the
+  violations fed back into the prompt, then hard-FAILED (never silently
+  accepted). The result is persisted alongside the draft (sar_grounded).
+  Orchestrated as a real LangGraph StateGraph: network_tracer ->
+  behavioral_analyst -> sar_generator -> groundedness_guardrail, with a
+  conditional edge from the guardrail back to the generator (max 1 retry).
+- 2026-07-10 — Chunk 8: SAR storage is ON THE COSMOS VERTEX (sar_draft,
+  sar_generated_at, sar_grounded, sar_model properties on the flagged
+  Account), not Azure SQL Warehouse -- the PDD's pipeline diagram mentions
+  one, but Chunk 3 deliberately never provisioned it and there's no budget
+  justification to add one for this build. Same category of deliberate
+  scope-down as the partition-key and Tableau-extract decisions. The
+  enterprise path (SQL Warehouse for SAR archives + audit trail) remains a
+  Terraform module away if ever needed.
 
 ## Environment & Resource Reference
 
@@ -393,6 +440,7 @@ Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed
 - Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (still $0). LOADED: 5,387 vertices (1,853 Account / 1,853 Customer / 102 Device / 1,530 IPAddress / 49 Merchant) + 7,182 edges (1,380 FT / 1,580 AF / 831 UD / 1,538 SA / 1,853 OWNS, now 1:1 with every loaded account) -- the representative subset, not the full corpus. RBAC: "Cosmos DB Gremlin Built-in Data Contributor" on `argus-graph-container` for the current az CLI identity (role assignment id `fea56381-280f-4482-8619-1eb6e0933ed1`) -- **not Terraform-tracked** (azurerm has no native resource for this preview API yet; see Architectural Decisions Log). Both `graph/loader.py` and `ml/inference/inference_service.py` authenticate via this grant + `DefaultAzureCredential`, no account key.
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- still empty; Chunk 4 authenticated to Event Hubs via Azure AD/RBAC instead of a connection string, so no secret was needed here yet. Chunk 10 will use it for whatever genuinely needs a stored secret in production.
 - Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (still pending; not this chunk's scope either)
+- Foundry (AIServices) account: `argus-dev-foundry-to614f` (S0, $0 fixed cost) + project `argus-dev-proj`. LLM deployment: `gpt-5-mini-argus` (gpt-5-mini v2025-08-07, GlobalStandard, 50K TPM of the subscription's 500K quota; PAYG token billing as normal Azure consumption). Endpoint `https://argus-dev-foundry-to614f.services.ai.azure.com/openai/v1/`, called with the deployment name as `model`. RBAC: current az CLI identity has "Cognitive Services User" on the account (dev-only bridge, same caveat as the other grants). NOTE: originally planned as claude-opus-4-8 -- blocked by subscription-level 0-TPM Claude quota; see Architectural Decisions Log.
 - Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to redacted@example.com
 
 Connection strings, keys, and the random suffix's source are in Terraform state (`infra/envs/dev/terraform.tfstate`, gitignored) -- never in this file.
@@ -429,6 +477,13 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
 - Chunk 6/7 model caveat: near-perfect metrics reflect synthetic rings
   that are structurally conspicuous by construction — they validate the
   pipeline, not real-world fraud performance.
+- Claude models are quota-blocked (hard 0 TPM, subscription-level) on this
+  subscription -- the Chunk 8 agents run gpt-5-mini instead of the
+  originally-intended Claude Opus 4.8. If a Microsoft quota-increase
+  request is ever filed and granted, modules/foundry_llm still contains
+  the azapi deployment pattern in its history (git) and the swap back is
+  one module change. The Chunk 3 East-US-2 region rationale (Claude
+  availability) is unaffected -- everything else lives there anyway.
 - The Cosmos Gremlin RBAC role assignment (Data Contributor, current az
   CLI identity, scoped to argus-graph-container) exists only via az CLI,
   not Terraform -- `azurerm` has no native resource for
@@ -444,7 +499,7 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
 - `data/` — `scripts/` holds `graph_schema.py` (shared vertex/edge schema + real-data derivation), `acquire_ieee_cis.py` (Kaggle acquisition + bundled-sample fallback), `ring_injector.py` (synthetic ring injection), `eda_report.py` (validation/EDA); `raw/` and `simulated/` are gitignored but currently populated (bundled sample + 45 injected rings) — regenerate anytime via the three scripts in order
 - `ingestion/` — real Cargo crate: `src/lib.rs` (RawTransaction/EnrichedTransaction, `Sink` trait, `LocalFileSink`/`StdoutSink`, SHA-256 PII masking, 8 passing unit/integration tests), `src/event_hub_sink.rs` (`EventHubSink` -- Azure AD auth via `DeveloperToolsCredential`, retry w/ backoff), `src/main.rs` (binary entrypoint; `ARGUS_SINK=eventhub` targets real Event Hubs, `ARGUS_EVENT_LIMIT` caps volume), `examples/eventhub_validate.rs` (send+read-back round-trip check); Chunk 5 is next
 - `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction) and `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- inference loads these); `inference/` holds `inference_service.py` (Event Hubs consumer -> incremental state -> GNN scoring -> Cosmos write-back, `--validate` for post-run checks) + `prepare_validation_events.py`. NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
-- `agents/` — scaffolded, empty (LangGraph compliance loop lands Chunk 8)
+- `agents/` — `compliance_graph.py` (real LangGraph StateGraph: NetworkTracer w/ live Gremlin traversals, BehavioralAnalyst w/ real transaction metrics, SARGenerator w/ real Foundry LLM call, groundedness guardrail w/ conditional retry edge), `orchestrator.py` (Cosmos cross-query discovery of flagged accounts -> pipeline -> SAR stored on vertex), `requirements.txt`. Runs on global Python (no torch needed)
 - `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation; `--validate` for checks only, `--add-ring-owns` for the targeted OWNS-edge fix; auth via `DefaultAzureCredential` + Gremlin RBAC, no account key) + `requirements.txt` (gremlinpython, azure-identity)
 - `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
 - `dashboards/` — scaffolded, empty (Tableau lands Chunk 9)
@@ -606,5 +661,26 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   pattern. Flagged transparently: the role assignment isn't
   Terraform-tracked (azurerm has no native resource for this preview API
   yet).
+- 2026-07-10 — Claude Code — Chunk 8 — LangGraph agentic compliance loop.
+  Researched the current Claude-on-Foundry mechanism (azapi required;
+  azurerm can't express modelProviderData), presented the deployment plan
+  ($5/$25 per MTok, Marketplace CCU billing, card-not-credits caveat), got
+  the one approved go-ahead -- then hit the documented eligibility wall:
+  InsufficientQuota, all Claude models hard-limited to 0 TPM on this
+  credit-grant subscription. Stopped, presented verified alternatives
+  (gpt-5-mini 500K TPM / o4-mini 100K), user approved gpt-5-mini. Deployed
+  gpt-5-mini-argus into the already-created argus-dev-foundry-to614f
+  account (module renamed foundry_claude->foundry_llm via terraform moved
+  block, zero destroys; explicit model version 2025-08-07 required --
+  omitting it 400s). Smoke test via DefaultAzureCredential: PASS. Built
+  agents/: real Gremlin-traversal NetworkTracer, real-metrics
+  BehavioralAnalyst (velocity, inbound/outbound ratio, pass-through
+  symmetry, burst, amount_std from the actual 590K-row corpus), real-LLM
+  SARGenerator, deterministic groundedness guardrail, wired as a LangGraph
+  StateGraph with a conditional retry edge. Orchestrator run: 6 flagged
+  accounts discovered via Cosmos cross-query (all 6 ring members, score
+  1.0), 6 SAR drafts generated, 6/6 passed groundedness on first attempt
+  (0 regenerations), all 6 stored on their Account vertices (sar_draft/
+  sar_generated_at/sar_grounded/sar_model). Total LLM cost: ~$0.02.
 
-Last updated: 2026-07-09 by Claude Code
+Last updated: 2026-07-10 by Claude Code

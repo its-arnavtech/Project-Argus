@@ -49,3 +49,15 @@ output "container_apps_environment_name" {
 output "budget_name" {
   value = module.budget_alert.budget_name
 }
+
+output "foundry_account_name" {
+  value = module.foundry_llm.account_name
+}
+
+output "llm_openai_endpoint" {
+  value = module.foundry_llm.openai_endpoint
+}
+
+output "llm_deployment_name" {
+  value = module.foundry_llm.deployment_name
+}
