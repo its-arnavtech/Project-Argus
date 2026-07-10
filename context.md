@@ -12,19 +12,22 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 4 — Wire ingestion to real Azure Event Hubs
 - [x] Chunk 5 — Cosmos DB graph schema + loader
 - [x] Chunk 6 — GNN training pipeline
-- [ ] Chunk 7 — Real-time GNN inference service  ← IN PROGRESS
-- [ ] Chunk 8 — LangGraph agentic compliance loop
+- [x] Chunk 7 — Real-time GNN inference service
+- [ ] Chunk 8 — LangGraph agentic compliance loop  ← IN PROGRESS
 - [ ] Chunk 9 — Tableau dashboard
 - [ ] Chunk 10 — Production hardening
 - [ ] Chunk 11 — Load testing & SLO validation
 - [ ] Chunk 12 — Docs polish & demo packaging
 
 ## Current State
-- Active chunk: 7
-- Exact next action: run the real-time inference service end-to-end
-  (ml/inference/ — service code written: prepare_validation_events.py →
-  Rust binary sends events → inference_service.py consumes, scores,
-  writes gnn_risk_score to Cosmos → post-run sanity validation).
+- Active chunk: 8
+- Exact next action: run Chunk 8 prompt (LangGraph agentic compliance loop
+  — Network Tracer / Behavioral Analyst / SAR Generator agents per POC
+  section 4; discovers flagged nodes by querying Cosmos directly with
+  g.V().has('gnn_risk_score', gt(threshold)), NOT via a separate messaging
+  channel — that decision is logged below. Azure AI Foundry / Claude
+  deployment provisioning belongs to this chunk and needs user approval
+  before creating any billable resource).
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -293,6 +296,30 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   requiring an input example -- brittle for dynamic-graph GNNs, so the
   model is logged as plain artifacts (state_dict + config + feature
   stats), which is what Chunk 7 loads anyway.
+- 2026-07-09 — Chunk 7: streaming inference is CROSS-QUERY, NOT
+  CROSS-QUEUE. No new Azure infrastructure was provisioned (hard
+  constraint this session): the service consumes the existing
+  `transactions` hub and writes gnn_risk_score back onto Account vertices
+  in the existing argus-graph-container. Chunk 8's compliance agent
+  discovers high-risk nodes by querying Cosmos directly
+  (g.V().has('gnn_risk_score', gt(threshold))) -- no separate
+  notification hub/queue for flagged accounts. The composite index on
+  gnn_risk_score (provisioned in Chunk 5 prep) is what makes that query
+  cheap.
+- 2026-07-09 — Chunk 7: inference architecture -- local graph state is
+  WARM-STARTED from data/simulated/'s parquet snapshot (the same
+  aggregates training used; cold-start would produce scores from a
+  distribution the model never saw), then updated incrementally per event
+  (Welford variance, counterparty/device sets, new transfer edges).
+  Scoring runs a full-graph forward per batch instead of per-node 2-hop
+  subgraph extraction -- exactly equivalent for a 2-layer model and
+  simpler; at 40K nodes/2.68M edges CPU it costs ~9-12s per batch, which
+  is the main latency driver (see Known Issues). Python Event Hubs SDK
+  confirmed against Microsoft docs before writing: EventHubConsumerClient
+  + receive_batch + starting_position="@latest" (skips Chunk 4's leftover
+  test events), and azure.identity's DefaultAzureCredential DOES exist in
+  the Python SDK (unlike Rust's DeveloperToolsCredential) -- Chunk 4's
+  RBAC grants cover it, no new secrets.
 
 ## Environment & Resource Reference
 
@@ -327,17 +354,25 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   `MissingSubscriptionRegistration`, run
   `az provider register -n <Namespace>` and re-plan/re-apply.
 - Chunk 4's validation left ~6,000 test events sitting in the `transactions`
-  hub (two 3,000-event validation runs). Harmless — 1-day retention means
-  they age out on their own — but Chunk 5's Cosmos loader should expect
-  this test traffic if it ever reads directly from the hub instead of
-  `data/simulated/`.
-- No ML/agent code yet.
+  hub (two 3,000-event validation runs), plus 400 more from Chunk 7's
+  validation. Harmless — 1-day retention ages them out — and Chunk 7's
+  consumer used starting_position="@latest" specifically to skip them.
+- Chunk 7 inference latency (amortized per event: mean 326ms, p95 468ms)
+  is ABOVE the PDD's <300ms directional target. Dominant costs: the
+  full-graph forward pass (~9-12s/batch over 2.68M edges, CPU) and
+  sequential Gremlin score writes (~55-90ms each). Obvious paths down:
+  affected-subgraph-scoped forward, parallel/batched writes, GPU. Formal
+  latency work is Chunk 11's job — flagged, not hidden.
+- Chunk 6/7 model caveat: near-perfect metrics reflect synthetic rings
+  that are structurally conspicuous by construction — they validate the
+  pipeline, not real-world fraud performance.
+- No agent code yet (Chunk 8 next).
 
 ## File Map
 - `docs/` — `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` holds chunk1_data_eda_summary.md and partition_key_strategy.md (Gremlin partition key + indexing policy reasoning)
 - `data/` — `scripts/` holds `graph_schema.py` (shared vertex/edge schema + real-data derivation), `acquire_ieee_cis.py` (Kaggle acquisition + bundled-sample fallback), `ring_injector.py` (synthetic ring injection), `eda_report.py` (validation/EDA); `raw/` and `simulated/` are gitignored but currently populated (bundled sample + 45 injected rings) — regenerate anytime via the three scripts in order
 - `ingestion/` — real Cargo crate: `src/lib.rs` (RawTransaction/EnrichedTransaction, `Sink` trait, `LocalFileSink`/`StdoutSink`, SHA-256 PII masking, 8 passing unit/integration tests), `src/event_hub_sink.rs` (`EventHubSink` -- Azure AD auth via `DeveloperToolsCredential`, retry w/ backoff), `src/main.rs` (binary entrypoint; `ARGUS_SINK=eventhub` targets real Event Hubs, `ARGUS_EVENT_LIMIT` caps volume), `examples/eventhub_validate.rs` (send+read-back round-trip check); Chunk 5 is next
-- `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction) and `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- Chunk 7 loads these); `inference/` holds `inference_service.py` + `prepare_validation_events.py` (Chunk 7, in progress). NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
+- `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction) and `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- inference loads these); `inference/` holds `inference_service.py` (Event Hubs consumer -> incremental state -> GNN scoring -> Cosmos write-back, `--validate` for post-run checks) + `prepare_validation_events.py`. NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
 - `agents/` — scaffolded, empty (LangGraph compliance loop lands Chunk 8)
 - `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation, `--validate` for checks only) + `requirements.txt` (gremlinpython)
 - `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
@@ -464,5 +499,19 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   real-world-fraud performance. Artifacts exported to ml/artifacts/ for
   Chunk 7. Environment: ML runs via repo .venv (Windows MAX_PATH broke
   global torch), MLflow on sqlite (filesystem backend deprecated in 3.14).
+- 2026-07-09 — Claude Code — Chunk 7 — real-time GNN inference service.
+  ml/inference/inference_service.py: consumes the existing `transactions`
+  hub (EventHubConsumerClient, DefaultAzureCredential, @latest), warm-
+  starts local graph state from parquet, applies events incrementally,
+  full-graph forward per batch, writes gnn_risk_score + gnn_scored_at to
+  Cosmos Account vertices via gremlinpython. NO new Azure infrastructure.
+  End-to-end validation: 400 real transactions (biased toward ring-member
+  endpoints, all among Chunk 5's loaded accounts) sent through the actual
+  Rust ingestion binary -> Event Hubs -> service; 400 consumed, 600 score
+  writes across batches, 475 distinct Account vertices scored. Sanity
+  check PASSED emphatically: mean gnn_risk_score 0.844 for ring members
+  vs 3.9e-14 for legit accounts. Latency (honest): amortized mean 326ms,
+  p95 468ms per event -- ABOVE the <300ms directional target; drivers and
+  remediation paths logged in Known Issues, formal gate is Chunk 11.
 
 Last updated: 2026-07-09 by Claude Code
