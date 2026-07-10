@@ -320,6 +320,69 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   test events), and azure.identity's DefaultAzureCredential DOES exist in
   the Python SDK (unlike Rust's DeveloperToolsCredential) -- Chunk 4's
   RBAC grants cover it, no new secrets.
+- 2026-07-09 — Fix: ring-injected accounts now get OWNS edges too. Chunk
+  5's OWNS addition only wired background accounts (`derive_account_universe`);
+  ring accounts (`ring_injector.py`'s `_new_account_customer_rows`, used by
+  all 3 ring archetypes) got a Customer vertex but no edge connecting it.
+  Fixed at the source: `_new_account_customer_rows` now returns the OWNS
+  edge alongside the account/customer rows it already creates (one place,
+  used by circular/smurfing/device_cluster-non-reuse; the device_cluster
+  reuse path needs nothing new since it reuses accounts already OWNS-linked
+  by an earlier ring). Reran the full pipeline: 40,289 total OWNS edges
+  (39,974 background + 315 ring, i.e. exactly 1:1 with every account, no
+  gaps). Cosmos already had all 315 ring accounts' Account AND Customer
+  vertices loaded (Chunk 5's subset selection follows Account.cust_id,
+  which always included ring accounts) -- only the 315 missing edges
+  needed adding, not a full reload: `graph/loader.py --add-ring-owns`,
+  idempotent (checks for an existing edge before adding), 0 skipped on
+  this run since none existed. Re-validated Customer->OWNS->Account
+  specifically on a RING member this time (the original Chunk 5
+  validation's `g.V().hasLabel('Customer').limit(1)` happened to land on
+  a background customer, never exercising the case this fix addresses) --
+  confirmed PASS: CUST-R-CIRC-000-0 -> ACC-R00000.
+- 2026-07-09 — SECURITY CORRECTION: Chunk 5's claim that "Cosmos Gremlin
+  has no native AAD data-plane auth, password must be the account key"
+  was WRONG -- it was accepted from a documentation page's general
+  statement without testing the actual current capability. Gremlin-
+  specific RBAC is real:
+  `Microsoft.DocumentDB/databaseAccounts/gremlinRoleDefinitions` +
+  `gremlinRoleAssignments` (confirmed present in azurerm's underlying ARM
+  API surface through 2026-04-01-preview; built-in roles "Cosmos DB
+  Gremlin Built-in Data Reader"/"Data Contributor" exist and are listable
+  via `az cosmosdb gremlin role definition list`). Verified empirically,
+  not just from docs: created a role assignment
+  (`az cosmosdb gremlin role assignment create`, principal = the same az
+  CLI identity used throughout this project, scope = argus-graph-container,
+  role = Data Contributor), then connected gremlinpython using a plain
+  `DefaultAzureCredential().get_token("https://cosmos.azure.com/.default")`
+  token as the wire-protocol password -- worked for read, write, AND
+  delete (tested a full add/read-back/drop cycle on a throwaway vertex).
+  Migrated both `graph/loader.py` and `ml/inference/inference_service.py`
+  off the account key entirely -- no more `ARGUS_COSMOS_KEY`, no more
+  `az cosmosdb keys list` subprocess calls. Both now authenticate Cosmos
+  Gremlin the same way Chunk 4 authenticates Event Hubs: a Microsoft
+  Entra token via `azure-identity`, no static secret anywhere. One caveat
+  worth being honest about: Microsoft's own "Secure your Azure Cosmos DB
+  for Apache Gremlin account" page still states plainly that "Cosmos DB
+  does not natively support authentication via managed identity" -- that
+  statement is either stale relative to this RBAC feature, or refers
+  specifically to a different (managed-identity-only) path than the
+  RBAC-role-assignment + user/service-principal-token path actually
+  tested here. Either way, what was tested is what's now running in this
+  repo's code, empirically confirmed against the live account, not
+  assumed from either the old claim or the new docs.
+- 2026-07-09 — Known gap, flagged not hidden: the Gremlin RBAC role
+  assignment just created (`fea56381-280f-4482-8619-1eb6e0933ed1`,
+  Data Contributor, scoped to argus-graph-container) exists ONLY via az
+  CLI -- it is NOT tracked in Terraform state. `azurerm` has no native
+  resource for `gremlinRoleAssignments`/`gremlinRoleDefinitions` yet (this
+  is a preview API surface); formalizing it would need the `azapi`
+  provider (a new Terraform dependency), which wasn't added in this
+  session since it wasn't asked for and adding a new provider is a real
+  decision, not a drive-by. Practical implication: if `cosmos-argus-dev-to614f`
+  is ever destroyed/recreated via Terraform, this role assignment won't
+  come back automatically -- rerun the `az cosmosdb gremlin role
+  assignment create` command logged above (or formalize via `azapi` first).
 
 ## Environment & Resource Reference
 
@@ -327,7 +390,7 @@ Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed
 
 - Resource group: `rg-argus-dev`
 - Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
-- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (still $0). LOADED as of Chunk 5: 5,387 vertices (1,853 Account / 1,853 Customer / 102 Device / 1,530 IPAddress / 49 Merchant) + 6,867 edges (1,380 FT / 1,580 AF / 831 UD / 1,538 SA / 1,538 OWNS) -- the representative subset, not the full corpus
+- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (still $0). LOADED: 5,387 vertices (1,853 Account / 1,853 Customer / 102 Device / 1,530 IPAddress / 49 Merchant) + 7,182 edges (1,380 FT / 1,580 AF / 831 UD / 1,538 SA / 1,853 OWNS, now 1:1 with every loaded account) -- the representative subset, not the full corpus. RBAC: "Cosmos DB Gremlin Built-in Data Contributor" on `argus-graph-container` for the current az CLI identity (role assignment id `fea56381-280f-4482-8619-1eb6e0933ed1`) -- **not Terraform-tracked** (azurerm has no native resource for this preview API yet; see Architectural Decisions Log). Both `graph/loader.py` and `ml/inference/inference_service.py` authenticate via this grant + `DefaultAzureCredential`, no account key.
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- still empty; Chunk 4 authenticated to Event Hubs via Azure AD/RBAC instead of a connection string, so no secret was needed here yet. Chunk 10 will use it for whatever genuinely needs a stored secret in production.
 - Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (still pending; not this chunk's scope either)
 - Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to redacted@example.com
@@ -366,6 +429,14 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
 - Chunk 6/7 model caveat: near-perfect metrics reflect synthetic rings
   that are structurally conspicuous by construction — they validate the
   pipeline, not real-world fraud performance.
+- The Cosmos Gremlin RBAC role assignment (Data Contributor, current az
+  CLI identity, scoped to argus-graph-container) exists only via az CLI,
+  not Terraform -- `azurerm` has no native resource for
+  gremlinRoleAssignments/gremlinRoleDefinitions yet (preview API surface).
+  If the Cosmos account is ever recreated via Terraform, this grant won't
+  come back automatically. Recheck when azurerm adds native support, or
+  formalize now via the `azapi` provider if that dependency becomes
+  worth it.
 - No agent code yet (Chunk 8 next).
 
 ## File Map
@@ -374,7 +445,7 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
 - `ingestion/` — real Cargo crate: `src/lib.rs` (RawTransaction/EnrichedTransaction, `Sink` trait, `LocalFileSink`/`StdoutSink`, SHA-256 PII masking, 8 passing unit/integration tests), `src/event_hub_sink.rs` (`EventHubSink` -- Azure AD auth via `DeveloperToolsCredential`, retry w/ backoff), `src/main.rs` (binary entrypoint; `ARGUS_SINK=eventhub` targets real Event Hubs, `ARGUS_EVENT_LIMIT` caps volume), `examples/eventhub_validate.rs` (send+read-back round-trip check); Chunk 5 is next
 - `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction) and `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- inference loads these); `inference/` holds `inference_service.py` (Event Hubs consumer -> incremental state -> GNN scoring -> Cosmos write-back, `--validate` for post-run checks) + `prepare_validation_events.py`. NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
 - `agents/` — scaffolded, empty (LangGraph compliance loop lands Chunk 8)
-- `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation, `--validate` for checks only) + `requirements.txt` (gremlinpython)
+- `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation; `--validate` for checks only, `--add-ring-owns` for the targeted OWNS-edge fix; auth via `DefaultAzureCredential` + Gremlin RBAC, no account key) + `requirements.txt` (gremlinpython, azure-identity)
 - `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
 - `dashboards/` — scaffolded, empty (Tableau lands Chunk 9)
 - `tests/` — `unit/`, `integration/`, `load/` scaffolded, empty
@@ -513,5 +584,27 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   vs 3.9e-14 for legit accounts. Latency (honest): amortized mean 326ms,
   p95 468ms per event -- ABOVE the <300ms directional target; drivers and
   remediation paths logged in Known Issues, formal gate is Chunk 11.
+- 2026-07-09 — Claude Code — Pre-Chunk-8 fixes (both requested because
+  Chunk 8's Network Tracer agent depends on them). (1) Ring-injected
+  accounts now get OWNS edges: fixed at the source in
+  ring_injector.py's `_new_account_customer_rows`, reran the full
+  pipeline (40,289 total OWNS edges, exactly 1:1 with every account),
+  added only the 315 missing edges to Cosmos via a new
+  `graph/loader.py --add-ring-owns` (idempotent, no full reload needed --
+  both endpoints were already loaded), re-validated Customer->OWNS->Account
+  specifically on a ring member this time (CUST-R-CIRC-000-0 ->
+  ACC-R00000 -- PASS), since the original Chunk 5 validation happened to
+  test a background account instead. (2) Re-investigated the "Gremlin has
+  no AAD data-plane auth" claim from Chunk 5 -- it was wrong, accepted
+  from documentation without testing. Gremlin-specific RBAC
+  (gremlinRoleDefinitions/gremlinRoleAssignments) is real; got explicit
+  user approval, then empirically confirmed a Data Contributor role
+  assignment's Entra token IS accepted by the actual wire-protocol
+  connection (read/write/delete all tested). Migrated graph/loader.py and
+  ml/inference/inference_service.py off the account key entirely onto
+  DefaultAzureCredential -- consistent with Chunk 4's no-static-secrets
+  pattern. Flagged transparently: the role assignment isn't
+  Terraform-tracked (azurerm has no native resource for this preview API
+  yet).
 
 Last updated: 2026-07-09 by Claude Code

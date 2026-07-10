@@ -27,10 +27,14 @@ Architecture notes (logged in context.md):
     identifiers, so mixing spaces only means an account's device set can
     grow, never collide -- acceptable for directional Chunk 7 validation.
 
-Auth: Event Hubs via azure.identity DefaultAzureCredential (Azure AD, no
-static secret -- reuses Chunk 4's RBAC grants); Cosmos Gremlin via account
-key from ARGUS_COSMOS_KEY / `az cosmosdb keys list` at runtime (Gremlin has
-no AAD data-plane auth -- same constraint as Chunk 5's loader).
+Auth: both Event Hubs AND Cosmos Gremlin via azure.identity
+DefaultAzureCredential (Azure AD tokens, no static secret anywhere). The
+Cosmos side was corrected after an earlier session wrongly accepted "no
+AAD data-plane auth for Gremlin, must use the account key" without testing
+it -- Gremlin-specific RBAC (gremlinRoleDefinitions/gremlinRoleAssignments)
+is real, and its token IS accepted by the wire-protocol connection,
+verified empirically (see graph/loader.py's docstring for how it was
+tested). Reuses the same role assignment as the loader.
 
 Usage:
     python ml/inference/inference_service.py             # consume + score + write back
@@ -41,7 +45,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -65,7 +68,6 @@ EVENTHUB_NAMESPACE = os.environ.get(
 EVENTHUB_NAME = os.environ.get("ARGUS_EVENTHUB_NAME", "transactions")
 
 COSMOS_ACCOUNT = "cosmos-argus-dev-to614f"
-RESOURCE_GROUP = "rg-argus-dev"
 DATABASE = "argus-graph"
 GRAPH = "argus-graph-container"
 PARTITION_KEY_VALUE = "argus"
@@ -74,20 +76,16 @@ MAX_EVENTS = int(os.environ.get("ARGUS_MAX_EVENTS", "500"))
 IDLE_TIMEOUT_S = int(os.environ.get("ARGUS_IDLE_TIMEOUT", "45"))
 
 
-def get_cosmos_key() -> str:
-    key = os.environ.get("ARGUS_COSMOS_KEY")
-    if key:
-        return key
-    out = subprocess.run(
-        ["az", "cosmosdb", "keys", "list", "--resource-group", RESOURCE_GROUP,
-         "--name", COSMOS_ACCOUNT, "--type", "keys",
-         "--query", "primaryMasterKey", "-o", "tsv"],
-        capture_output=True, text=True, check=True, shell=True,
-    )
-    return out.stdout.strip()
+def get_cosmos_token() -> str:
+    """Entra ID token, scoped to the Cosmos data-plane audience -- requires
+    the same Gremlin RBAC role assignment graph/loader.py uses. No static
+    key, no ARGUS_COSMOS_KEY env var."""
+    from azure.identity import DefaultAzureCredential
+
+    return DefaultAzureCredential().get_token("https://cosmos.azure.com/.default").token
 
 
-def make_gremlin_client(key: str):
+def make_gremlin_client(token: str):
     from gremlin_python.driver import client as gclient
     from gremlin_python.driver import serializer
 
@@ -95,7 +93,7 @@ def make_gremlin_client(key: str):
         url=f"wss://{COSMOS_ACCOUNT}.gremlin.cosmos.azure.com:443/",
         traversal_source="g",
         username=f"/dbs/{DATABASE}/colls/{GRAPH}",
-        password=key,
+        password=token,
         message_serializer=serializer.GraphSONSerializersV2d0(),
     )
 
@@ -205,7 +203,7 @@ class InferenceService:
         self.model.eval()
 
         self.state = GraphState()
-        self.gclient = make_gremlin_client(get_cosmos_key())
+        self.gclient = make_gremlin_client(get_cosmos_token())
         loaded = self.gclient.submit(
             "g.V().hasLabel('Account').values('acct_id')"
         ).all().result()
@@ -315,7 +313,7 @@ class InferenceService:
 
 def validate() -> None:
     """Post-run sanity checks against Cosmos."""
-    c = make_gremlin_client(get_cosmos_key())
+    c = make_gremlin_client(get_cosmos_token())
     try:
         scored = c.submit(
             "g.V().hasLabel('Account').has('gnn_risk_score').count()"

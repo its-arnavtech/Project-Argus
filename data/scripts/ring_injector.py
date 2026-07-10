@@ -90,7 +90,17 @@ def _new_account_customer_rows(ids: list[str], ring_id: str, ring_type: str, rng
             "provenance": "synthetic_ring",
         }
     )
-    return accounts, customers
+    # OWNS: Customer -> Account, same 1:1 pairing as background accounts get
+    # in derive_account_universe(). Every new ring account is created here
+    # alongside its Customer, so this is the single place that needs to emit
+    # it -- device_cluster's "reuse" path (see inject_rings) reuses accounts
+    # already created through this function, so they already have one.
+    owns = pd.DataFrame({"src_cust_id": cust_ids, "dst_acct_id": ids})
+    owns["provenance"] = "synthetic_ring"
+    owns["is_synthetic"] = True
+    owns["ring_id"] = ring_id
+    owns["ring_type"] = ring_type
+    return accounts, customers, owns
 
 
 def inject_rings(tables: GraphTables, seed: int = SEED):
@@ -98,7 +108,7 @@ def inject_rings(tables: GraphTables, seed: int = SEED):
     t_min, t_max = tables.funds_transfer["timestamp"].min(), tables.funds_transfer["timestamp"].max()
     background_accts = tables.accounts["acct_id"].to_numpy()
 
-    new_accounts, new_customers, new_devices, new_ips = [], [], [], []
+    new_accounts, new_customers, new_owns, new_devices, new_ips = [], [], [], [], []
     new_ft, new_af, new_ud = [], [], []
     manifest_rows = []
     acct_counter = 0
@@ -115,9 +125,10 @@ def inject_rings(tables: GraphTables, seed: int = SEED):
         ring_id = f"CIRC-{r:03d}"
         size = rng.integers(4, 9)
         ids = next_ids(size)
-        accounts, customers = _new_account_customer_rows(ids, ring_id, "circular", rng)
+        accounts, customers, owns = _new_account_customer_rows(ids, ring_id, "circular", rng)
         new_accounts.append(accounts)
         new_customers.append(customers)
+        new_owns.append(owns)
         ring_account_pool.extend(ids)
 
         start_t = rng.integers(t_min, max(t_min + 1, t_max - 3600))
@@ -181,9 +192,10 @@ def inject_rings(tables: GraphTables, seed: int = SEED):
         smurf_ids = next_ids(n_smurfs)
         exit_ids = next_ids(n_exits)
         all_ids = [collector_id] + smurf_ids + exit_ids
-        accounts, customers = _new_account_customer_rows(all_ids, ring_id, "smurfing", rng)
+        accounts, customers, owns = _new_account_customer_rows(all_ids, ring_id, "smurfing", rng)
         new_accounts.append(accounts)
         new_customers.append(customers)
+        new_owns.append(owns)
         ring_account_pool.extend(all_ids)
 
         start_t = rng.integers(t_min, max(t_min + 1, t_max - 3600))
@@ -239,9 +251,10 @@ def inject_rings(tables: GraphTables, seed: int = SEED):
             ids = list(rng.choice(ring_account_pool, size=size, replace=False))
         else:
             ids = next_ids(size)
-            accounts, customers = _new_account_customer_rows(ids, ring_id, "device_cluster", rng)
+            accounts, customers, owns = _new_account_customer_rows(ids, ring_id, "device_cluster", rng)
             new_accounts.append(accounts)
             new_customers.append(customers)
+            new_owns.append(owns)
             ring_account_pool.extend(ids)
 
         device_hash = f"DEV-R{_md5(ring_id)[:10]}"
@@ -308,6 +321,7 @@ def inject_rings(tables: GraphTables, seed: int = SEED):
 
     accounts_out = pd.concat([tables.accounts] + new_accounts, ignore_index=True)
     customers_out = pd.concat([tables.customers] + new_customers, ignore_index=True)
+    owns_out = pd.concat([tables.owns] + new_owns, ignore_index=True) if new_owns else tables.owns
     devices_out = pd.concat([tables.devices] + new_devices, ignore_index=True) if new_devices else tables.devices
     ips_out = pd.concat([tables.ip_addresses] + new_ips, ignore_index=True) if new_ips else tables.ip_addresses
     ft_out = pd.concat([tables.funds_transfer] + new_ft, ignore_index=True)
@@ -315,10 +329,12 @@ def inject_rings(tables: GraphTables, seed: int = SEED):
     ud_out = pd.concat([tables.used_device] + new_ud, ignore_index=True) if new_ud else tables.used_device
 
     manifest = pd.DataFrame(manifest_rows)
-    # Ring-injected accounts don't get their own OWNS edges here (out of
-    # scope for the OWNS-edge addition that introduced this field -- see
-    # graph_schema.py); their Customer records still exist, just not linked
-    # by an edge yet. Passed through unchanged from the background tables.
+    # Every ring-injected account now gets an OWNS edge from its own
+    # Customer, same as background accounts -- SECURITY/CORRECTNESS FIX:
+    # previously only background accounts had one (Audit Flag #3, prior
+    # session). device_cluster's "reuse" path doesn't need a new OWNS edge
+    # here since it reuses accounts already created (and already
+    # OWNS-linked) earlier in this same function.
     return (
         GraphTables(
             accounts=accounts_out,
@@ -330,7 +346,7 @@ def inject_rings(tables: GraphTables, seed: int = SEED):
             accessed_from=af_out,
             used_device=ud_out,
             settled_at=tables.settled_at,
-            owns=tables.owns,
+            owns=owns_out,
         ),
         manifest,
     )

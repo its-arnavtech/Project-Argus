@@ -8,3 +8,4 @@ numpy>=1.24
 pyarrow>=14.0
 gremlinpython>=3.8
 azure-eventhub>=5.11
+azure-identity>=1.15

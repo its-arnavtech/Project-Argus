@@ -14,33 +14,42 @@ volume capped per legit account. The container shares the free tier's
 1000 RU/s pool; a full load now would throttle for hours with no signal.
 Full-scale load is Chunk 11's job.
 
-Cosmos Gremlin constraints honored here (confirmed against Microsoft Learn
-docs, 2026-07-09, not assumed):
+Cosmos Gremlin constraints/capabilities honored here (confirmed against
+Microsoft Learn docs AND empirically tested against the live account,
+2026-07-09 -- not assumed):
   - No Gremlin bytecode -- string queries via client.submit() + bindings.
   - GraphSON v2 serializer only (GraphSONSerializersV2d0).
-  - No native AAD data-plane auth for Gremlin: username is
-    /dbs/{db}/colls/{graph}, password is the account key. The key is read
-    from ARGUS_COSMOS_KEY or fetched at runtime via `az cosmosdb keys list`
-    -- never hardcoded, never committed.
+  - SECURITY CORRECTION: an earlier session accepted "no AAD data-plane
+    auth for Gremlin, password must be the account key" as a platform
+    constraint without testing it. That was wrong. Gremlin-specific RBAC
+    (`Microsoft.DocumentDB/databaseAccounts/gremlinRoleDefinitions` +
+    `gremlinRoleAssignments`, built-in roles "Cosmos DB Gremlin Built-in
+    Data Reader"/"Data Contributor") is real and its Entra ID token IS
+    accepted by the actual wire-protocol connection as the password field
+    -- verified empirically: created a role assignment via
+    `az cosmosdb gremlin role assignment create`, then connected with a
+    plain `DefaultAzureCredential` token and performed a real write/read/
+    delete round-trip. No static key anywhere in this file anymore.
   - `null` property values are rejected -- None/NaN columns are skipped
     per-row.
 
 Usage:
-    python graph/loader.py            # load subset (drops existing data first)
-    python graph/loader.py --validate # run traversal validation only, no load
+    python graph/loader.py                 # load subset (drops existing data first)
+    python graph/loader.py --validate      # run traversal validation only, no load
+    python graph/loader.py --add-ring-owns # add only the ring accounts' OWNS
+                                            # edges (both endpoints already
+                                            # loaded; targeted fix, no drop)
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from azure.identity import DefaultAzureCredential
 from gremlin_python.driver import client as gclient
 from gremlin_python.driver import serializer
 from gremlin_python.driver.protocol import GremlinServerError
@@ -49,7 +58,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SIM_DIR = REPO_ROOT / "data" / "simulated"
 
 COSMOS_ACCOUNT = "cosmos-argus-dev-to614f"
-RESOURCE_GROUP = "rg-argus-dev"
 DATABASE = "argus-graph"
 GRAPH = "argus-graph-container"
 GREMLIN_URL = f"wss://{COSMOS_ACCOUNT}.gremlin.cosmos.azure.com:443/"
@@ -60,30 +68,20 @@ N_LEGIT_SAMPLE = 1500  # legit accounts sampled alongside all 315 ring members
 MAX_RETRIES = 6
 
 
-def get_cosmos_key() -> str:
-    key = os.environ.get("ARGUS_COSMOS_KEY")
-    if key:
-        return key
-    print("[LOADER] ARGUS_COSMOS_KEY not set -- fetching via az cosmosdb keys list")
-    out = subprocess.run(
-        [
-            "az", "cosmosdb", "keys", "list",
-            "--resource-group", RESOURCE_GROUP,
-            "--name", COSMOS_ACCOUNT,
-            "--type", "keys",
-            "--query", "primaryMasterKey", "-o", "tsv",
-        ],
-        capture_output=True, text=True, check=True, shell=True,
-    )
-    return out.stdout.strip()
+def get_cosmos_token() -> str:
+    """Entra ID token, scoped to the Cosmos data-plane audience -- requires
+    a Gremlin RBAC role assignment on the caller's identity (see
+    infra/envs/dev/main.tf's dev_cosmos_gremlin_data_contributor). No
+    static key, no ARGUS_COSMOS_KEY env var, nothing to leak or rotate."""
+    return DefaultAzureCredential().get_token("https://cosmos.azure.com/.default").token
 
 
-def make_client(key: str) -> gclient.Client:
+def make_client(token: str) -> gclient.Client:
     return gclient.Client(
         url=GREMLIN_URL,
         traversal_source="g",
         username=f"/dbs/{DATABASE}/colls/{GRAPH}",
-        password=key,
+        password=token,
         message_serializer=serializer.GraphSONSerializersV2d0(),
     )
 
@@ -191,6 +189,41 @@ def select_subset(rng: np.random.Generator):
     }
 
 
+def add_ring_owns_edges(c: gclient.Client) -> int:
+    """Targeted fix: ring-injected accounts originally had no OWNS edge
+    (only background accounts did -- see context.md Audit Flag #3).
+    ring_injector.py now emits one for every ring account too; both
+    endpoints (the ring Account and its Customer) were already loaded in
+    Chunk 5 (Account's cust_id FK column always included ring accounts),
+    so this only needs to add the missing edges, not reload vertices.
+    Idempotent: skips any (src, dst) pair that already has an OWNS edge,
+    safe to rerun."""
+    owns = pd.read_parquet(SIM_DIR / "edges_owns.parquet")
+    ring_owns = owns[owns["provenance"] == "synthetic_ring"]
+    n_added, n_skipped = 0, 0
+    for row in ring_owns.to_dict("records"):
+        props = clean_props(row)
+        src = str(props.pop("src_cust_id"))
+        dst = str(props.pop("dst_acct_id"))
+        exists = submit(
+            c,
+            "g.V(srcId).has('partitionKey', pk).outE('OWNS').where(inV().has('acct_id', dstId)).count()",
+            {"srcId": src, "dstId": dst, "pk": PARTITION_KEY_VALUE},
+        )[0]
+        if exists:
+            n_skipped += 1
+            continue
+        query = "g.V(srcId).has('partitionKey', pk).addE('OWNS').to(g.V(dstId).has('partitionKey', pk))"
+        bindings = {"srcId": src, "dstId": dst, "pk": PARTITION_KEY_VALUE}
+        for i, (k, v) in enumerate(props.items()):
+            query += f".property('{k}', p{i})"
+            bindings[f"p{i}"] = v
+        submit(c, query, bindings)
+        n_added += 1
+    print(f"[LOADER] ring OWNS edges added: {n_added} (skipped {n_skipped} already present)")
+    return n_added
+
+
 def drop_existing(c: gclient.Client) -> None:
     """Batched drop -- a single g.V().drop() over a large graph times out or
     blows the RU budget in one request."""
@@ -281,26 +314,42 @@ def validate(c: gclient.Client) -> None:
         ok = len(shared_dev) > 0 or len(shared_ip) > 0
         print(f"    multi-hop connectivity: {'PASS' if ok else 'FAIL'}")
 
-    # (b) Customer -> OWNS -> Account
+    # (b) Customer -> OWNS -> Account. Specifically on a RING member this
+    # time -- the original Chunk 5 validation picked "the first Customer
+    # found", which happened to be a background account, not a ring
+    # account, so it never actually exercised the case this fix addresses.
     owns_count = submit(c, "g.E().hasLabel('OWNS').count()")[0]
+    ring_owns_count = submit(
+        c, "g.E().hasLabel('OWNS').where(inV().has('is_ring_member', true)).count()"
+    )[0]
     sample = submit(
         c,
-        "g.V().hasLabel('Customer').limit(1).as('c')"
-        ".out('OWNS').as('a').select('c','a').by(values('cust_id')).by(values('acct_id'))",
+        "g.V().hasLabel('Account').has('is_ring_member', true).limit(1).as('a')"
+        ".in('OWNS').as('c').select('c','a').by(values('cust_id')).by(values('acct_id'))",
     )
-    print(f"(b) OWNS edges: {owns_count}; sample Customer->OWNS->Account: {sample}")
-    print(f"    OWNS traversal: {'PASS' if owns_count > 0 and sample else 'FAIL'}")
+    print(
+        f"(b) OWNS edges: {owns_count} total, {ring_owns_count} on ring accounts; "
+        f"sample Customer->OWNS->Account (ring member): {sample}"
+    )
+    print(f"    OWNS traversal (ring member): {'PASS' if ring_owns_count > 0 and sample else 'FAIL'}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate", action="store_true", help="validation only, no load")
+    parser.add_argument(
+        "--add-ring-owns",
+        action="store_true",
+        help="add only the ring accounts' OWNS edges (targeted fix, no drop/reload)",
+    )
     args = parser.parse_args()
 
-    key = get_cosmos_key()
-    c = make_client(key)
+    token = get_cosmos_token()
+    c = make_client(token)
     try:
-        if not args.validate:
+        if args.add_ring_owns:
+            add_ring_owns_edges(c)
+        elif not args.validate:
             rng = np.random.default_rng(SEED)
             subset = select_subset(rng)
             planned_v = sum(len(df) for df, _ in subset["vertices"].values())

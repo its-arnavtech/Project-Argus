@@ -15,7 +15,7 @@ Generated from `data/simulated/` (acquisition data_source: `real_kaggle`, seed: 
 | accessed_from | 590540 | 42 | 590582 |
 | used_device | 118666 | 42 | 118708 |
 | settled_at | 590540 | 0 | 590540 |
-| owns | 39974 | 0 | 39974 |
+| owns | 39974 | 315 | 40289 |
 
 ## Class Balance (Account vertices)
 
