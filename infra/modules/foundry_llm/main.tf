@@ -103,7 +103,11 @@ resource "azurerm_cognitive_deployment" "llm" {
     capacity = var.capacity
   }
 
-  version_upgrade_option = "OnceNewDefaultVersionAvailable"
+  # NoAutoUpgrade: the pinned model version must never silently change --
+  # a compliance pipeline's output characteristics shouldn't drift because
+  # Azure rotated a default (was OnceNewDefaultVersionAvailable; flagged as
+  # an audit item and locked down in the Chunk 8 follow-up).
+  version_upgrade_option = "NoAutoUpgrade"
 
   depends_on = [azapi_resource.project]
 }

@@ -466,7 +466,7 @@ Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed
 - Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (still $0). LOADED: 5,387 vertices (1,853 Account / 1,853 Customer / 102 Device / 1,530 IPAddress / 49 Merchant) + 7,182 edges (1,380 FT / 1,580 AF / 831 UD / 1,538 SA / 1,853 OWNS, now 1:1 with every loaded account) -- the representative subset, not the full corpus. RBAC: "Cosmos DB Gremlin Built-in Data Contributor" on `argus-graph-container` for the current az CLI identity (role assignment id `fea56381-280f-4482-8619-1eb6e0933ed1`) -- **not Terraform-tracked** (azurerm has no native resource for this preview API yet; see Architectural Decisions Log). Both `graph/loader.py` and `ml/inference/inference_service.py` authenticate via this grant + `DefaultAzureCredential`, no account key.
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- still empty; Chunk 4 authenticated to Event Hubs via Azure AD/RBAC instead of a connection string, so no secret was needed here yet. Chunk 10 will use it for whatever genuinely needs a stored secret in production.
 - Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (still pending; not this chunk's scope either)
-- Foundry (AIServices) account: `argus-dev-foundry-to614f` (S0, $0 fixed cost) + project `argus-dev-proj`. LLM deployment: `gpt-5-mini-argus` (gpt-5-mini v2025-08-07, GlobalStandard, 50K TPM of the subscription's 500K quota; PAYG token billing as normal Azure consumption). Endpoint `https://argus-dev-foundry-to614f.services.ai.azure.com/openai/v1/`, called with the deployment name as `model`. RBAC: current az CLI identity has "Cognitive Services User" on the account (dev-only bridge, same caveat as the other grants). NOTE: originally planned as claude-opus-4-8 -- blocked by subscription-level 0-TPM Claude quota; see Architectural Decisions Log.
+- Foundry (AIServices) account: `argus-dev-foundry-to614f` (S0, $0 fixed cost) + project `argus-dev-proj`. LLM deployment: `gpt-5-mini-argus` (gpt-5-mini v2025-08-07, GlobalStandard, 50K TPM of the subscription's 500K quota, version_upgrade_option=NoAutoUpgrade; PAYG token billing as normal Azure consumption). Endpoint `https://argus-dev-foundry-to614f.services.ai.azure.com/openai/v1/`, called with the deployment name as `model`. RBAC: current az CLI identity has "Cognitive Services User" on the account (dev-only bridge, same caveat as the other grants). NOTE: originally planned as claude-opus-4-8 -- blocked by subscription-level 0-TPM Claude quota; see Architectural Decisions Log.
 - Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to redacted@example.com
 
 Connection strings, keys, and the random suffix's source are in Terraform state (`infra/envs/dev/terraform.tfstate`, gitignored) -- never in this file.
@@ -504,8 +504,11 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   that are structurally conspicuous by construction — they validate the
   pipeline, not real-world fraud performance.
 - Claude models are quota-blocked (hard 0 TPM, subscription-level) on this
-  subscription -- the Chunk 8 agents run gpt-5-mini instead of the
-  originally-intended Claude Opus 4.8. If a Microsoft quota-increase
+  subscription -- as are ALL flagship OpenAI tiers (full gpt-5, gpt-5.1,
+  5.2, 5.4, 5.5, 5.6 -- confirmed in the Chunk 8 follow-up); only
+  mini/small tiers carry quota. The Chunk 8 agents run gpt-5-mini
+  (reasoning_effort=medium) instead of the originally-intended Claude
+  Opus 4.8. If a Microsoft quota-increase
   request is ever filed and granted, modules/foundry_llm still contains
   the azapi deployment pattern in its history (git) and the swap back is
   one module change. The Chunk 3 East-US-2 region rationale (Claude
@@ -708,6 +711,24 @@ Connection strings, keys, and the random suffix's source are in Terraform state 
   1.0), 6 SAR drafts generated, 6/6 passed groundedness on first attempt
   (0 regenerations), all 6 stored on their Account vertices (sar_draft/
   sar_generated_at/sar_grounded/sar_model). Total LLM cost: ~$0.02.
+  ADDENDUM (2026-07-10 follow-up): (1) attempted upgrade to full gpt-5 --
+  it is quota-blocked exactly like Claude (0 TPM at GlobalStandard, along
+  with gpt-5.1/5.2/5.4/5.5/5.6; only mini/small tiers carry quota on this
+  subscription), so per the prescribed fallback, reasoning_effort was
+  raised on gpt-5-mini instead. HIGH effort backfired: hidden reasoning
+  consumed the entire 6K completion budget on 3 of 6 accounts and returned
+  EMPTY drafts -- which the guardrail passed VACUOUSLY (no text = no
+  entities = no violations). Two fixes: the guardrail now hard-fails any
+  draft under 200 chars ("empty or truncated"), and effort settled at
+  MEDIUM with a 10K completion budget -- rerun produced 6/6 non-empty
+  (1,209-1,735 chars), 6/6 grounded. Honest quality read: medium-effort
+  drafts are marginally better than the originals (recommendation now
+  names the linked counterparty accounts; neighbor GNN scores woven into
+  the narrative) but substantially similar -- not a step change; latency
+  roughly doubled (~11-16s -> ~22-32s per draft). (2) Deployment
+  version_upgrade_option locked to NoAutoUpgrade (was
+  OnceNewDefaultVersionAvailable) -- the pinned model version can no
+  longer silently change; prior session's Audit Flag #12 resolved.
 - 2026-07-10 — Claude Code — Chunk 9 — Tableau analytics layer via
   flattened extract. dashboards/export_tableau_extract.py: real Gremlin
   queries (475 scored accounts, 158 flagged, 6 grounded SARs) + full-corpus

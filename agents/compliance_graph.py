@@ -283,10 +283,16 @@ def sar_generator_agent(state: AgentState) -> dict[str, Any]:
             {"role": "system", "content": SAR_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        max_completion_tokens=3000,
+        # Chunk 8 follow-up: full gpt-5 is quota-blocked like Claude, so
+        # quality comes from effort on gpt-5-mini instead. MEDIUM, not high:
+        # at high, hidden reasoning consumed the entire completion budget on
+        # 3 of 6 accounts and returned EMPTY drafts (found empirically).
+        # Budget sized generously anyway -- reasoning tokens bill as
+        # completion tokens and must leave room for the prose.
+        max_completion_tokens=10000,
     )
     try:
-        resp = llm.chat.completions.create(**kwargs, reasoning_effort="low")
+        resp = llm.chat.completions.create(**kwargs, reasoning_effort="medium")
     except Exception:
         resp = llm.chat.completions.create(**kwargs)
 
@@ -346,6 +352,15 @@ def groundedness_guardrail(state: AgentState) -> dict[str, Any]:
     draft = state.get("sar_draft", "")
     evidence_text = json.dumps(state.get("evidence_bundle", {}))
     violations: list[str] = []
+
+    # An empty/truncated draft must FAIL, not pass vacuously -- with no
+    # text there are no entities to check, which the Chunk 8 follow-up
+    # showed lets reasoning-budget-exhausted empty responses sail through.
+    if len(draft.strip()) < 200:
+        violations.append(
+            f"draft empty or truncated ({len(draft.strip())} chars) -- "
+            "not a reviewable SAR narrative"
+        )
 
     for pat in _ENTITY_PATTERNS:
         for m in set(pat.findall(draft)):
