@@ -104,8 +104,9 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   train_identity.csv (~710MB), since we never use the unlabeled test
   files.
 - 2026-07-09 — Chunk 3: real Azure infra provisioned via Terraform, dev
-  tier, into "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID,
-  confirmed with the user as the ~$75 credit grant subscription before
+  tier, into "Azure subscription 1" (subscription ID redacted -- see local
+  terraform.tfvars / az account show; not committed, see 2026-07-11 security
+  pass), confirmed with the user as the ~$75 credit grant subscription before
   touching anything). All resources locked to East US 2: Claude Opus 4.8
   on Azure AI Foundry (needed in Chunk 8) is only Hosted-on-Azure in East
   US 2 / Sweden Central, and co-locating everything now avoids cross-
@@ -123,8 +124,9 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   concrete and reversible in one change.
 - 2026-07-09 — Chunk 3: added an azurerm_consumption_budget_resource_group
   scoped to rg-argus-dev, $75/month, alert notifications at 50/75/90% of
-  budget to redacted@example.com -- a hard ceiling on real spend
-  while iterating, not just documentation of intent.
+  budget to the alert email configured in the (gitignored) terraform.tfvars
+  -- a hard ceiling on real spend while iterating, not just documentation
+  of intent.
 - 2026-07-09 — Chunk 3: verified all Terraform resource schemas against
   the live hashicorp/azurerm v4.80.0 provider docs (fetched from the
   provider's GitHub source, since the Terraform Registry site itself is
@@ -459,7 +461,7 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 
 ## Environment & Resource Reference
 
-Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed with the user 2026-07-09 as the ~$75 credit grant subscription. Region: East US 2 (eastus2) for all resources. Provisioned via infra/envs/dev (tier=dev):
+Azure subscription: "Azure subscription 1" (subscription ID redacted -- see local terraform.tfvars / az account show), confirmed with the user 2026-07-09 as the ~$75 credit grant subscription. Region: East US 2 (eastus2) for all resources. Provisioned via infra/envs/dev (tier=dev):
 
 - Resource group: `rg-argus-dev`
 - Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
@@ -467,9 +469,9 @@ Azure subscription: "Azure subscription 1" (REDACTED-SUBSCRIPTION-ID), confirmed
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- still empty; Chunk 4 authenticated to Event Hubs via Azure AD/RBAC instead of a connection string, so no secret was needed here yet. Chunk 10 will use it for whatever genuinely needs a stored secret in production.
 - Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (still pending; not this chunk's scope either)
 - Foundry (AIServices) account: `argus-dev-foundry-to614f` (S0, $0 fixed cost) + project `argus-dev-proj`. LLM deployment: `gpt-5-mini-argus` (gpt-5-mini v2025-08-07, GlobalStandard, 50K TPM of the subscription's 500K quota, version_upgrade_option=NoAutoUpgrade; PAYG token billing as normal Azure consumption). Endpoint `https://argus-dev-foundry-to614f.services.ai.azure.com/openai/v1/`, called with the deployment name as `model`. RBAC: current az CLI identity has "Cognitive Services User" on the account (dev-only bridge, same caveat as the other grants). NOTE: originally planned as claude-opus-4-8 -- blocked by subscription-level 0-TPM Claude quota; see Architectural Decisions Log.
-- Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to redacted@example.com
+- Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to the alert email in the (gitignored) terraform.tfvars
 
-Connection strings, keys, and the random suffix's source are in Terraform state (`infra/envs/dev/terraform.tfstate`, gitignored) -- never in this file.
+Connection strings, keys, the subscription ID, the alert email, and the random suffix's source are in Terraform state / terraform.tfvars (both gitignored) -- never in this file. (2026-07-11 security pass: subscription ID and alert email were previously written out in full here and in terraform.tfvars/variables.tf; redacted and purged from git history -- see Architectural Decisions Log.)
 
 ## Known Issues / TODO
 - RESOLVED 2026-07-09: `data/raw/` now holds the real IEEE-CIS dataset

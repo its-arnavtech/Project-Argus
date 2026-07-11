@@ -69,8 +69,7 @@ locals {
 
 variable "subscription_id" {
   type        = string
-  description = "Azure subscription to deploy into. Confirmed 2026-07-09 with the user: the ~$75 credit grant subscription ('Azure subscription 1')."
-  default     = "REDACTED-SUBSCRIPTION-ID"
+  description = "Azure subscription to deploy into (the ~$75 credit grant subscription, 'Azure subscription 1'). No default -- set via TF_VAR_subscription_id or the gitignored terraform.tfvars so it never lands in git history."
 }
 
 variable "location" {

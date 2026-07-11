@@ -16,6 +16,9 @@ venv/
 *.tfstate.backup
 tfplan*
 *.tfplan
+*.tfvars
+*.auto.tfvars
+!*.tfvars.example
 # .terraform.lock.hcl is committed (pins provider versions reproducibly, like Cargo.lock) -- do not ignore it
 
 # Data (raw/simulated datasets are not committed)
