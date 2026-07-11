@@ -15,16 +15,16 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 7 — Real-time GNN inference service
 - [x] Chunk 8 — LangGraph agentic compliance loop
 - [x] Chunk 9 — Tableau dashboard
-- [ ] Chunk 10 — Production hardening  ← IN PROGRESS
-- [ ] Chunk 11 — Load testing & SLO validation
+- [x] Chunk 10 — Production hardening
+- [ ] Chunk 11 — Load testing & SLO validation  ← IN PROGRESS
 - [ ] Chunk 12 — Docs polish & demo packaging
 
 ## Current State
-- Active chunk: 10
-- Exact next action: run Chunk 10 prompt (production hardening — managed
-  identities replacing the dev-only RBAC bridges, Key Vault-backed PII
-  salt, ingestion container deployment into argus-dev-cae, resilience
-  patterns deferred from Chunk 4).
+- Active chunk: 11
+- Exact next action: run Chunk 11 prompt (load testing & SLO validation —
+  the PDD's 15,000 events/sec ingestion and <300ms inference targets get
+  their formal measurement; Event Hubs TU count may need a temporary bump;
+  full-corpus Cosmos load was also deferred to this chunk).
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -446,6 +446,85 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   is the "refresh". Enterprise migration path: set analytical_storage_ttl
   on the container, add Synapse Link, repoint the workbook's connection --
   the calculated fields wouldn't change.
+- 2026-07-11 — Chunk 10: PII salt moved from the Chunk 2 env-var placeholder
+  to the Key Vault secret `argus-pii-salt` (cryptographically random,
+  generated locally, never committed/printed). The Rust engine fetches it
+  at startup via azure_security_keyvault_secrets 1.0 (`SecretClient::new`
+  + `get_secret(...).into_model()` -- API verified against the SDK's own
+  README/source, same discipline as Chunk 4) using a shared credential
+  chain (`azure_credential()` in lib.rs): ManagedIdentityCredential when
+  IDENTITY_ENDPOINT/MSI_ENDPOINT is present (Container Apps), else
+  DeveloperToolsCredential (az CLI). `ARGUS_PII_SALT` survives ONLY as a
+  loud, explicit local/offline override; the silent insecure default salt
+  is gone -- no vault and no override now fails startup, which is correct
+  for a production credential path.
+- 2026-07-11 — Chunk 10: velocity_score_1m stub (open since Chunk 2)
+  closed with a REAL per-account trailing-60s sliding window
+  (VelocityTracker, in-process HashMap<account, VecDeque<timestamps>>).
+  Verified real: a 6-event single-account burst scored 1->2->3->4->5->6.
+  Deliberate tradeoffs, documented not hidden: in-process (Redis isn't
+  budget-justified) => state resets on restart, is per-replica if KEDA
+  ever scales >1, and windows over INGESTION ARRIVAL time (RawTransaction
+  carries no event timestamp) -- batch replays measure replay rate, which
+  is the correct semantic for the live-stream service the deployment
+  exists for.
+- 2026-07-11 — Chunk 10: dead-letter path for sends that exhaust retries --
+  a local JSONL file ({timestamp, error, payload} per line), NOT a second
+  Event Hub / Service Bus queue (explicitly not budget-justified;
+  ephemeral in the container, adequate because every dead-letter also
+  hits stderr -> Log Analytics). Real bug found while testing it: tokio's
+  File::write_all buffers internally and records could evaporate before
+  reaching the OS (reproducible ~1-in-5 test flake) -- every dead-letter
+  write now flushes through; 8/8 repeat runs green after the fix.
+- 2026-07-11 — Chunk 10: TLS posture verified against the live resources,
+  reported honestly: Event Hubs minimumTlsVersion=1.2 (its ceiling as a
+  configurable floor), Cosmos minimalTlsVersion=Tls12 (no Tls13 option
+  exists), Key Vault exposes no TLS property at all (platform-managed
+  >=1.2). The PDD's "TLS 1.3 tunnels" is NOT enforceable as a floor on
+  any of the three -- the true posture is "1.2 enforced everywhere, 1.3
+  negotiated opportunistically", documented in
+  docs/architecture/observability_queries.md. Claiming literal TLS-1.3
+  compliance would be false.
+- 2026-07-11 — Chunk 10: containerization + registry. Multi-stage
+  Dockerfile (rust:1.96-slim-trixie builder -> debian:trixie-slim
+  runtime, 141MB, non-root) -- image size kept small deliberately for
+  Container Apps cold-start. Two facts found empirically: (1) the Azure
+  Rust crates link OpenSSL on Linux (reqwest native-tls inside
+  azure_core) even though they use rustls for AMQP -- the initial
+  rustls-only image failed to build; (2) the repo is PRIVATE, which broke
+  the planned anonymous-GHCR pull; per user choice the image builds in
+  GitHub Actions (GITHUB_TOKEN has packages:write natively) and the
+  package is flipped public via one manual UI step -- $0, vs an ACR at
+  ~$5/mo. The public artifact is the compiled binary only.
+- 2026-07-11 — Chunk 10: KEDA scale rule (azure-eventhub, managed-identity
+  auth via custom_scale_rule.identity_id="System" -- attribute verified in
+  the azurerm provider SOURCE; the website doc misspells it). PDD's
+  ">5,000 undrained items" scaled 10x down to
+  unprocessedEventThreshold=500 / activation=500, min 0 / max 1 replica.
+  Two verified-not-assumed facts: the scaler REQUIRES a blob checkpoint
+  container even with MI auth (hence the stargusdev* storage account,
+  ~$0/mo, sole purpose KEDA checkpoints), and since NOTHING in this build
+  commits checkpoints (the inference consumer reads @latest), KEDA counts
+  all retained (<24h) events as unprocessed: a >500 burst activates the
+  replica, which stays up until those events age out of the 1-day
+  retention, then returns to 0. That is the literal semantics of
+  "undrained" on a hub nobody drains; a checkpointing consumer
+  (enterprise path) would make it lag-accurate. Honest architectural
+  oddity, carried from the PDD itself: the deployed app is a PRODUCER
+  being scaled on consumer-side lag -- exactly what the PDD's trigger
+  describes, demonstrative rather than load-bearing in this build.
+- 2026-07-11 — Chunk 10: two-identity model, both paths kept deliberately.
+  DEV (local work): the az CLI identity's grants from Chunks 4/8 --
+  Event Hubs Sender+Receiver, Gremlin Data Contributor (now
+  Terraform-tracked via azapi after a state import -- the untracked-grant
+  gap is closed), Cognitive Services User, Key Vault Secrets Officer.
+  PROD (deployed service): the Container App's system-assigned managed
+  identity -- Event Hubs Data Sender (it produces) + Data Receiver (the
+  KEDA scaler reads lag under the app identity), Key Vault Secrets User
+  (salt), Storage Blob Data Reader (KEDA checkpoints), and Gremlin Data
+  Contributor via azapi (ANTICIPATORY: today's service has no Gremlin
+  code path -- granted per the chunk instruction, flagged as unused
+  rather than silently over-provisioned).
 - 2026-07-10 — Chunk 9 SPEC CORRECTION: PDD section 3's Syndicate Cascade
   Index formula (`COUNTD([tx_id]) * SUM([amount]) * AVG([velocity_score_1m])
   * IF [proxy_flag] THEN 1.5 ELSE 1.0 END`) mixes aggregates with a
@@ -466,8 +545,11 @@ Azure subscription: "Azure subscription 1" (subscription ID redacted -- see loca
 - Resource group: `rg-argus-dev`
 - Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
 - Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (still $0). LOADED: 5,387 vertices (1,853 Account / 1,853 Customer / 102 Device / 1,530 IPAddress / 49 Merchant) + 7,182 edges (1,380 FT / 1,580 AF / 831 UD / 1,538 SA / 1,853 OWNS, now 1:1 with every loaded account) -- the representative subset, not the full corpus. RBAC: "Cosmos DB Gremlin Built-in Data Contributor" on `argus-graph-container` for the current az CLI identity (role assignment id `fea56381-280f-4482-8619-1eb6e0933ed1`) -- **not Terraform-tracked** (azurerm has no native resource for this preview API yet; see Architectural Decisions Log). Both `graph/loader.py` and `ml/inference/inference_service.py` authenticate via this grant + `DefaultAzureCredential`, no account key.
-- Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- still empty; Chunk 4 authenticated to Event Hubs via Azure AD/RBAC instead of a connection string, so no secret was needed here yet. Chunk 10 will use it for whatever genuinely needs a stored secret in production.
-- Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law` -- no container deployed yet (still pending; not this chunk's scope either)
+- Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- holds `argus-pii-salt` (Chunk 10), the only secret this build genuinely needs stored (everything else is Entra-token auth).
+- Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law`. DEPLOYED (Chunk 10): Container App `argus-ingestion` (image `ghcr.io/its-arnavtech/argus-ingestion:chunk10`, CI-built via GitHub Actions, public package; 0.25 vCPU/0.5Gi, min 0 / max 1 replicas, KEDA azure-eventhub rule `eventhub-lag` @ 500-event threshold, MI-authenticated). System-assigned MI principal `19b38309-28e1-4e2c-8bf2-2092f9fd8bcd` with: EH Data Sender + Receiver (namespace), Key Vault Secrets User, Storage Blob Data Reader (checkpoints), Gremlin Data Contributor (anticipatory, unused today). Console logs flow to `argus-dev-law` via the environment's log-analytics binding; saved KQL queries in docs/architecture/observability_queries.md
+- Storage account `stargusdevto614f` (Standard LRS, ~$0/mo) -- sole purpose: KEDA azure-eventhub checkpoint container `keda-checkpoints`
+- Key Vault secret `argus-pii-salt` -- the production PII salt (Chunk 10); fetched at startup by the ingestion service via MI, by local dev via az CLI identity
+- TWO-IDENTITY MODEL (Chunk 10): dev = az CLI identity (EH Sender/Receiver, Gremlin Data Contributor, Cognitive Services User, KV Secrets Officer) for local scripts/agents; prod = argus-ingestion's system MI (grants above). Both deliberate, neither replaces the other; all Gremlin grants now Terraform-tracked via azapi (untracked-grant gap closed by state import)
 - Foundry (AIServices) account: `argus-dev-foundry-to614f` (S0, $0 fixed cost) + project `argus-dev-proj`. LLM deployment: `gpt-5-mini-argus` (gpt-5-mini v2025-08-07, GlobalStandard, 50K TPM of the subscription's 500K quota, version_upgrade_option=NoAutoUpgrade; PAYG token billing as normal Azure consumption). Endpoint `https://argus-dev-foundry-to614f.services.ai.azure.com/openai/v1/`, called with the deployment name as `model`. RBAC: current az CLI identity has "Cognitive Services User" on the account (dev-only bridge, same caveat as the other grants). NOTE: originally planned as claude-opus-4-8 -- blocked by subscription-level 0-TPM Claude quota; see Architectural Decisions Log.
 - Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to the alert email in the (gitignored) terraform.tfvars
 
@@ -505,37 +587,75 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
 - Chunk 6/7 model caveat: near-perfect metrics reflect synthetic rings
   that are structurally conspicuous by construction — they validate the
   pipeline, not real-world fraud performance.
-- Claude models are quota-blocked (hard 0 TPM, subscription-level) on this
-  subscription -- as are ALL flagship OpenAI tiers (full gpt-5, gpt-5.1,
-  5.2, 5.4, 5.5, 5.6 -- confirmed in the Chunk 8 follow-up); only
-  mini/small tiers carry quota. The Chunk 8 agents run gpt-5-mini
-  (reasoning_effort=medium) instead of the originally-intended Claude
-  Opus 4.8. If a Microsoft quota-increase
-  request is ever filed and granted, modules/foundry_llm still contains
-  the azapi deployment pattern in its history (git) and the swap back is
-  one module change. The Chunk 3 East-US-2 region rationale (Claude
-  availability) is unaffected -- everything else lives there anyway.
-- The Cosmos Gremlin RBAC role assignment (Data Contributor, current az
-  CLI identity, scoped to argus-graph-container) exists only via az CLI,
-  not Terraform -- `azurerm` has no native resource for
-  gremlinRoleAssignments/gremlinRoleDefinitions yet (preview API surface).
-  If the Cosmos account is ever recreated via Terraform, this grant won't
-  come back automatically. Recheck when azurerm adds native support, or
-  formalize now via the `azapi` provider if that dependency becomes
-  worth it.
+- SETTLED, PERMANENT CONSTRAINT (not an open TODO): Claude models are
+  quota-blocked (hard 0 TPM, subscription-level) on this subscription --
+  as are ALL flagship OpenAI tiers (full gpt-5, gpt-5.1, 5.2, 5.4, 5.5,
+  5.6 -- confirmed in the Chunk 8 follow-up); only mini/small tiers carry
+  quota. This is the credit-grant subscription classification and no
+  in-project action changes it. The Chunk 8 agents run gpt-5-mini
+  (reasoning_effort=medium) as the accepted final configuration for this
+  build. Only if a Microsoft quota-increase request were ever filed AND
+  granted (outside this project's control) would a swap back be relevant;
+  modules/foundry_llm's git history contains the azapi Claude deployment
+  pattern for that hypothetical. The Chunk 3 East-US-2 region rationale
+  is unaffected -- everything lives there anyway.
+- Unrelated-to-Argus budget drain, surfaced during the Chunk 10 budget
+  check: a Databricks workspace (rg-dp750, Germany West Central) burns
+  ~$1.15/day (NAT Gateway + VNet), invisible to the rg-argus-dev budget
+  alert. Not touched (not this project's resource) -- user informed.
+- RESOLVED 2026-07-11 (Chunk 10): the Gremlin RBAC grant is now
+  Terraform-tracked -- `azapi_resource.dev_gremlin_data_contributor`
+  in infra/envs/dev/ingestion_app.tf, brought under state with
+  `terraform import` (zero changes to the live resource). azurerm still
+  has no native resource for gremlinRoleAssignments; azapi is the
+  mechanism, same as the Foundry account.
 - No agent code yet (Chunk 8 next).
+- KEDA scaling limitation (Chunk 10, honest, not hidden): the deployed
+  service has no checkpointing consumer, so the azure-eventhub scale
+  rule's "unprocessedEventThreshold" counts ALL events retained in the
+  hub's 1-day window, not true consumer lag. Practical effect: activation
+  behaves like "a backlog of >500 events exists somewhere in the last
+  24h" rather than "the consumer is falling behind." Correct given the
+  hub has no draining consumer to lag behind; would need a checkpointing
+  reader to become lag-accurate. Verified behavior end-to-end at small
+  scale (600-event burst -> reactivation in ~25s); full-scale behavior
+  under sustained load is Chunk 11's job.
+- The Container App's managed identity was granted Cosmos Gremlin Data
+  Contributor per the Chunk 10 instruction, but the deployed service has
+  NO Gremlin code path today (produce-only, to Event Hubs) -- the grant
+  is unused, anticipatory, and flagged rather than silently
+  over-provisioned. Revisit if/when the ingestion engine ever writes to
+  the graph directly.
+- The GHCR package `argus-ingestion` is now PUBLIC (anonymous pull, to
+  let Container Apps fetch it without a stored registry credential) --
+  the repo itself stays private. The image contains only the compiled
+  release binary and no secrets/source, so this was judged an acceptable
+  tradeoff, but it is a real, deliberate visibility change worth knowing
+  is there.
+- The CI workflow (build-ingestion-image.yml) builds and pushes the
+  image but does NOT run `cargo test`/`cargo clippy` first -- those were
+  run manually this session (11/11 passing, clean) but aren't yet a CI
+  gate. A future chunk could add a test job before the build-push step;
+  not done here since it wasn't in this chunk's explicit scope.
+- The Container App was validated at small scale only (a single
+  600-event manual burst, one scale-to-zero/scale-up cycle observed) --
+  consistent with the standing rule that full-scale load validation is
+  Chunk 11's job, not this one's. Sustained throughput, concurrent
+  replica behavior (KEDA's max_replicas=1 here means no concurrency to
+  test yet), and the deployed container's actual events/sec under load
+  are all unmeasured.
 
 ## File Map
-- `docs/` — `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` holds chunk1_data_eda_summary.md and partition_key_strategy.md (Gremlin partition key + indexing policy reasoning)
+- `docs/` — `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` holds chunk1_data_eda_summary.md, partition_key_strategy.md, and observability_queries.md (KQL saved queries + verified TLS posture)
 - `data/` — `scripts/` holds `graph_schema.py` (shared vertex/edge schema + real-data derivation), `acquire_ieee_cis.py` (Kaggle acquisition + bundled-sample fallback), `ring_injector.py` (synthetic ring injection), `eda_report.py` (validation/EDA); `raw/` and `simulated/` are gitignored but currently populated (bundled sample + 45 injected rings) — regenerate anytime via the three scripts in order
-- `ingestion/` — real Cargo crate: `src/lib.rs` (RawTransaction/EnrichedTransaction, `Sink` trait, `LocalFileSink`/`StdoutSink`, SHA-256 PII masking, 8 passing unit/integration tests), `src/event_hub_sink.rs` (`EventHubSink` -- Azure AD auth via `DeveloperToolsCredential`, retry w/ backoff), `src/main.rs` (binary entrypoint; `ARGUS_SINK=eventhub` targets real Event Hubs, `ARGUS_EVENT_LIMIT` caps volume), `examples/eventhub_validate.rs` (send+read-back round-trip check); Chunk 5 is next
+- `ingestion/` — real Cargo crate (11 passing tests): `src/lib.rs` (structs, `Sink` trait, SHA-256 PII masking, `azure_credential()` MI/dev chain, `fetch_pii_salt()` Key Vault fetch, `VelocityTracker` real trailing-60s window, `DeadLetter` flushed JSONL), `src/event_hub_sink.rs` (Entra auth, retry w/ backoff), `src/main.rs` (`ARGUS_MODE=service` for the deployed container; `ARGUS_SINK=eventhub`, `ARGUS_EVENT_LIMIT`), `examples/eventhub_validate.rs`, `Dockerfile` + `.dockerignore` (multi-stage, 141MB, non-root)
 - `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction) and `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- inference loads these); `inference/` holds `inference_service.py` (Event Hubs consumer -> incremental state -> GNN scoring -> Cosmos write-back, `--validate` for post-run checks) + `prepare_validation_events.py`. NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
 - `agents/` — `compliance_graph.py` (real LangGraph StateGraph: NetworkTracer w/ live Gremlin traversals, BehavioralAnalyst w/ real transaction metrics, SARGenerator w/ real Foundry LLM call, groundedness guardrail w/ conditional retry edge), `orchestrator.py` (Cosmos cross-query discovery of flagged accounts -> pipeline -> SAR stored on vertex), `requirements.txt`. Runs on global Python (no torch needed)
 - `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation; `--validate` for checks only, `--add-ring-owns` for the targeted OWNS-edge fix; auth via `DefaultAzureCredential` + Gremlin RBAC, no account key) + `requirements.txt` (gremlinpython, azure-identity)
 - `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
 - `dashboards/` — `export_tableau_extract.py` (Gremlin + transaction queries flattened to `extracts/argus_tableau_extract.csv|parquet`, gitignored; rerun = refresh), `argus_fraud_dashboard.twb` (hand-authored workbook, three PDD section 3 calculated fields, needs visual check in Tableau Desktop)
 - `tests/` — `unit/`, `integration/`, `load/` scaffolded, empty
-- `.github/workflows/` — scaffolded, empty (CI lands later chunks)
+- `.github/workflows/` — `build-ingestion-image.yml` (CI image build+push to GHCR with the workflow's GITHUB_TOKEN; triggers on ingestion/** changes or manual dispatch)
 - Root — `README.md`, `LICENSE` (MIT), `.gitignore`, `context.md` (this file)
 
 ## Session Log
@@ -742,5 +862,61 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   as written; the other two verbatim) over that extract, one worksheet per
   field. XML validated well-formed; visual layout still needs a Tableau
   Desktop check (not available in this environment).
+- 2026-07-11 — Claude Code — Chunk 10 — Production hardening. Budget check
+  first: subscription MTD spend $12.43/$75, but $11.40 of that is an
+  unrelated Databricks resource group (germanywestcentral) burning
+  ~$1.15/day, invisible to the rg-argus-dev alert -- true Argus spend
+  ~$1.03, headroom ~$74 (flagged to user, not touched, not this
+  project's resource). Rust: PII salt now fetched from the real Key
+  Vault secret argus-pii-salt via azure_security_keyvault_secrets 1.0 +
+  a shared MI/dev credential chain (azure_credential() in lib.rs);
+  velocity_score_1m stub (open since Chunk 2) closed with a real
+  per-account trailing-60s sliding window (verified: a 6-event burst
+  from one account scored 1->2->3->4->5->6); dead-letter JSONL added
+  for exhausted-retry sends, and a real buffering bug was found and
+  fixed while testing it (tokio's File::write_all doesn't guarantee the
+  write reached disk -- fixed with an explicit flush, went from a
+  ~1-in-5 test flake to 8/8 green). 11/11 tests passing, clippy clean.
+  Container: multi-stage rust:1.96-slim-trixie -> debian:trixie-slim,
+  141MB; found empirically that the Azure crates need OpenSSL on Linux
+  (an initial rustls-only image failed to build) -- corrected, not
+  silently worked around. Registry: the repo is PRIVATE, which broke
+  the originally-assumed anonymous-GHCR-pull path; user chose GHCR +
+  a manual one-time "make package public" step over an ACR at ~$5/mo.
+  CI workflow (.github/workflows/build-ingestion-image.yml) builds and
+  pushes via the run's own GITHUB_TOKEN (packages:write) -- no local
+  token scope needed. Terraform (infra/envs/dev/ingestion_app.tf, plan
+  shown and approved before apply, 8 resources added/0 destroyed):
+  Container App argus-ingestion deployed into the EXISTING argus-dev-cae
+  (min 0/max 1 replicas), system-assigned MI granted EH Data
+  Sender+Receiver, Key Vault Secrets User, Storage Blob Data Reader,
+  and (anticipatory, flagged as currently unused) Gremlin Data
+  Contributor; a small storage account was added solely because KEDA's
+  azure-eventhub scaler requires a blob checkpoint container even under
+  MI auth (verified in KEDA docs, not assumed) -- ~$0/mo. The
+  previously-untracked dev-identity Gremlin RBAC grant was brought into
+  Terraform state via `terraform import` (zero live-resource change),
+  closing that known gap. KEDA rule verified end-to-end at small scale
+  (this chunk's validation ceiling; full load testing is Chunk 11's
+  job): confirmed scale-to-zero after ~7 idle minutes, sent a 600-event
+  burst via the local binary against the real hub, replica reactivated
+  within ~25 seconds and started cleanly (salt fetched from Key Vault,
+  correct sink). Documented honestly: with no checkpointing consumer in
+  this build, KEDA counts ALL retained (<24h) events as "unprocessed,"
+  so activation is closer to "any backlog exists" than true consumer
+  lag -- a correct-but-limited reading of the PDD's own
+  ">5,000 undrained items" trigger, scaled to 500 for this project.
+  TLS verified against live resources and reported honestly: Event Hubs
+  and Cosmos both cap at TLS 1.2 as a configurable floor, Key Vault
+  exposes no TLS setting at all (platform-managed >=1.2) -- the PDD's
+  literal "TLS 1.3 tunnels" is not achievable as an enforced floor on
+  any of the three; documented in
+  docs/architecture/observability_queries.md alongside 5 saved KQL
+  queries (throughput, error rate, dead-letter incidents, replica
+  lifecycle, heartbeat gaps) authored against Container Apps' documented
+  log schema. Confirmed the Chunk 8 LLM quota constraint is now worded
+  as a settled, permanent constraint rather than an open TODO. Two
+  Known-Issue items closed this chunk (velocity stub, untracked Gremlin
+  grant); no new stubs left silently in place.
 
-Last updated: 2026-07-10 by Claude Code
+Last updated: 2026-07-11 by Claude Code
