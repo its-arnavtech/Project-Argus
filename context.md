@@ -16,15 +16,14 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 8 — LangGraph agentic compliance loop
 - [x] Chunk 9 — Tableau dashboard
 - [x] Chunk 10 — Production hardening
-- [ ] Chunk 11 — Load testing & SLO validation  ← IN PROGRESS
-- [ ] Chunk 12 — Docs polish & demo packaging
+- [x] Chunk 11 — Load testing & SLO validation
+- [ ] Chunk 12 — Docs polish & demo packaging  ← IN PROGRESS
 
 ## Current State
-- Active chunk: 11
-- Exact next action: run Chunk 11 prompt (load testing & SLO validation —
-  the PDD's 15,000 events/sec ingestion and <300ms inference targets get
-  their formal measurement; Event Hubs TU count may need a temporary bump;
-  full-corpus Cosmos load was also deferred to this chunk).
+- Active chunk: 12
+- Exact next action: run Chunk 12 prompt (docs polish & demo packaging —
+  final README pass, architecture diagram/walkthrough, and whatever else
+  the last chunk needs to make this presentable as a portfolio piece).
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -537,16 +536,47 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
   structure/fields verified (well-formed, correct formulas), but visual
   rendering needs a check in actual Tableau Desktop, which this
   environment doesn't have.
+- 2026-07-12 — Chunk 11 — Load testing & SLO validation, key decisions
+  (full narrative, including the ~15 events/sec bug hunt and the
+  batch-vs-amortized latency discussion, is in the Session Log entry
+  below; this is the decision summary this Log's convention calls for).
+  KEDA DESIGN BUG CONFIRMED, fix deferred: the Chunk 10 scale rule scales
+  the ingestion PRODUCER on its own output hub's backlog -- verified
+  live that this doesn't relieve backlog (can't, structurally) and
+  triggers regardless of who's actually generating the load. Correct
+  fix (moving the rule to a containerized inference-service consumer,
+  scaling on its own checkpointed lag) requires new deployment
+  infrastructure, logged in Known Issues as a dedicated future item,
+  not implemented this chunk. SCALING: Event Hubs TUs 1->12 and
+  argus-ingestion max_replicas 1->5, both via new narrow override
+  variables (not a tier switch), plan shown and approved before
+  applying, then reverted to baseline (1/1) at the end -- partition
+  count (2) was never touched, confirmed immutable on Standard tier via
+  Microsoft's own FAQ. THROUGHPUT/LATENCY FIX: EventHubSink was
+  rewritten to batch internally (create_batch/send_batch) after the
+  original one-event-per-AMQP-round-trip design measured ~15 events/sec
+  against real Event Hubs at scale (vs. 14,675-15,151 events/sec after
+  the fix) -- the `Sink` trait's public interface didn't change.
+  FULL-SCALE EVAL (ml/training/eval_full_scale.py): all 315 known ring
+  labels score precision 1.000, FP-rate 0.000 (unchanged from the
+  Chunk 6 held-out split), recall improves to 0.9016 from 0.8235 (284
+  TP/31 FN) -- expected, since this includes rings the model trained
+  on; no hidden weakness surfaced, and the "synthetic rings are
+  structurally conspicuous by construction" caveat from Chunk 6 still
+  applies. FINAL SLO SCORECARD: throughput PASS, ingestion latency FAIL,
+  GNN inference latency FAIL, false-positive rate PASS -- see Session
+  Log entry and this session's chat summary for the full table with
+  real numbers.
 
 ## Environment & Resource Reference
 
 Azure subscription: "Azure subscription 1" (subscription ID redacted -- see local terraform.tfvars / az account show), confirmed with the user 2026-07-09 as the ~$75 credit grant subscription. Region: East US 2 (eastus2) for all resources. Provisioned via infra/envs/dev (tier=dev):
 
 - Resource group: `rg-argus-dev`
-- Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
+- Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU baseline -- temporarily 12 during Chunk 11's load test, reverted -- event hub `transactions`, 2 partitions [immutable on Standard tier, confirmed via Microsoft's FAQ, never changed], 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
 - Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (still $0). LOADED: 5,387 vertices (1,853 Account / 1,853 Customer / 102 Device / 1,530 IPAddress / 49 Merchant) + 7,182 edges (1,380 FT / 1,580 AF / 831 UD / 1,538 SA / 1,853 OWNS, now 1:1 with every loaded account) -- the representative subset, not the full corpus. RBAC: "Cosmos DB Gremlin Built-in Data Contributor" on `argus-graph-container` for the current az CLI identity (role assignment id `fea56381-280f-4482-8619-1eb6e0933ed1`) -- **not Terraform-tracked** (azurerm has no native resource for this preview API yet; see Architectural Decisions Log). Both `graph/loader.py` and `ml/inference/inference_service.py` authenticate via this grant + `DefaultAzureCredential`, no account key.
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- holds `argus-pii-salt` (Chunk 10), the only secret this build genuinely needs stored (everything else is Entra-token auth).
-- Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law`. DEPLOYED (Chunk 10, image source updated in the addendum): Container App `argus-ingestion` (image `acrargusdevto614f.azurecr.io/argus-ingestion:chunk10`, pulled via the app's own managed identity/AcrPull -- built+pushed to GHCR by CI, then `az acr import`'d into ACR; 0.25 vCPU/0.5Gi, min 0 / max 1 replicas, KEDA azure-eventhub rule `eventhub-lag` @ 500-event threshold, MI-authenticated). System-assigned MI principal `19b38309-28e1-4e2c-8bf2-2092f9fd8bcd` with: EH Data Sender + Receiver (namespace), Key Vault Secrets User, Storage Blob Data Reader (checkpoints), AcrPull (registry), Gremlin Data Contributor (anticipatory, unused today). Console logs flow to `argus-dev-law` via the environment's log-analytics binding; saved KQL queries in docs/architecture/observability_queries.md
+- Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law`. DEPLOYED (Chunk 10, image source updated in the addendum): Container App `argus-ingestion` (image `acrargusdevto614f.azurecr.io/argus-ingestion:chunk10`, pulled via the app's own managed identity/AcrPull -- built+pushed to GHCR by CI, then `az acr import`'d into ACR; 0.25 vCPU/0.5Gi, min 0 / max 1 replicas baseline [temporarily 5 during Chunk 11's load test, reverted], KEDA azure-eventhub rule `eventhub-lag` @ 500-event threshold, MI-authenticated -- see Chunk 11's Architectural Decision for why this rule scales the wrong tier). System-assigned MI principal `19b38309-28e1-4e2c-8bf2-2092f9fd8bcd` with: EH Data Sender + Receiver (namespace), Key Vault Secrets User, Storage Blob Data Reader (checkpoints), AcrPull (registry), Gremlin Data Contributor (anticipatory, unused today). Console logs flow to `argus-dev-law` via the environment's log-analytics binding; saved KQL queries in docs/architecture/observability_queries.md
 - Container Registry: `acrargusdevto614f` (Basic SKU, ~$5/mo, admin_enabled=false -- RBAC/MI pull only). Sole current image: `argus-ingestion:chunk10`.
 - Storage account `stargusdevto614f` (Standard LRS, ~$0/mo) -- sole purpose: KEDA azure-eventhub checkpoint container `keda-checkpoints`
 - Key Vault secret `argus-pii-salt` -- the production PII salt (Chunk 10); fetched at startup by the ingestion service via MI, by local dev via az CLI identity
@@ -637,29 +667,76 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   deployed app's pull source either way; the CI workflow still pushes
   there as a build artifact/cache, which is fine now that nothing
   depends on it being public.
-- The CI workflow (build-ingestion-image.yml) builds and pushes the
-  image but does NOT run `cargo test`/`cargo clippy` first -- those were
-  run manually this session (11/11 passing, clean) but aren't yet a CI
-  gate. A future chunk could add a test job before the build-push step;
-  not done here since it wasn't in this chunk's explicit scope.
-- The Container App was validated at small scale only (a single
-  600-event manual burst, one scale-to-zero/scale-up cycle observed) --
-  consistent with the standing rule that full-scale load validation is
-  Chunk 11's job, not this one's. Sustained throughput, concurrent
-  replica behavior (KEDA's max_replicas=1 here means no concurrency to
-  test yet), and the deployed container's actual events/sec under load
-  are all unmeasured.
+- RESOLVED 2026-07-11 (Chunk 10 addendum, missed updating this bullet at
+  the time): the CI workflow now has a `test` job (cargo test + clippy
+  -D warnings) that `build-and-push` `needs:` -- a red test run blocks
+  the image push. This bullet previously said otherwise; corrected here
+  during the Chunk 11 pass.
+- RESOLVED 2026-07-12 (Chunk 11): the Container App's real throughput
+  ceiling is no longer unmeasured -- see Architectural Decisions Log.
+  Real sustained throughput (14,675-15,151 events/sec, two runs) EXCEEDS
+  the PDD's 10,000/sec target. Getting a valid number required fixing a
+  real client-side bottleneck first (EventHubSink now batches internally
+  instead of one AMQP round trip per event -- see the Chunk 11 entry for
+  the full story of the ~15 events/sec failure that preceded the fix).
+- NEW 2026-07-12 (Chunk 11): ingestion latency FAILS the PDD's <45ms
+  target under real measurement, in both framings tried -- the clean
+  batch-round-trip number alone is ~170-174ms mean (already ~4x over),
+  and the full per-event number including this run's client-side
+  sequential-batch queueing is 16-18 SECONDS mean. The sequential (not
+  pipelined) batch dispatch in EventHubSink's batch_loop is a further,
+  separate improvement opportunity (allow several batches in flight
+  concurrently instead of one at a time) -- not fixed this chunk
+  (time-boxed; the batching fix itself was necessary just to get a
+  valid measurement, this is a refinement on top of it).
+- NEW 2026-07-12 (Chunk 11): GNN inference latency FAILS the PDD's
+  <300ms target on the metric that actually matters (per-batch, what an
+  individual event's score genuinely waits on: mean 21.96s, p95 34.08s)
+  -- the full-graph-forward-pass-per-batch architecture from Chunk 6/7
+  is fundamentally batch-shaped, and no per-node subgraph scoring exists
+  to avoid paying that fixed cost per batch regardless of event count.
+  The amortized per-event number (mean 8.07ms) technically clears the
+  target but is conditional on sustained high-volume batching, not a
+  true per-event figure -- see the honest discussion in Architectural
+  Decisions. Remediation path unchanged from Chunk 7's original note
+  (affected-subgraph-scoped forward pass, GPU, or parallelized Cosmos
+  writes), still not implemented -- this remains a real, open item, not
+  a mystery.
+- NEW 2026-07-12 (Chunk 11), KEDA scaling design bug -- CONFIRMED, fix
+  proposed but NOT implemented (a real deployment + code change, out of
+  this chunk's scope per instruction): the Chunk 10 KEDA rule scales
+  argus-ingestion (the producer) on backlog in the hub it produces
+  INTO. Verified live: sending load from elsewhere still caused
+  argus-ingestion to scale 0->2 replicas, without relieving the backlog
+  it scaled in response to (scaling a producer never can, structurally).
+  Correct fix: move the scale rule to a (not-yet-containerized)
+  Container App wrapping ml/inference/inference_service.py, scaling on
+  ITS OWN consumer-group lag, plus give that consumer a real checkpoint
+  store (also currently missing -- it uses starting_position="@latest"
+  with no persisted checkpoint at all) so the lag signal means what it
+  says. Needs: containerize the Python inference service (a Dockerfile,
+  similar to ingestion/'s), a new Container App + KEDA rule, and a
+  checkpoint store wired to the consumer -- a dedicated future chunk's
+  job, not a quick fix.
+- NEW 2026-07-12 (Chunk 11): the inference service's `max_batch_size`
+  was hardcoded at 100, which would take an estimated 16+ hours to
+  drain the full 590K-row corpus (the full-graph forward pass costs
+  ~6.5-17s roughly independent of batch event count, so small batches
+  multiply that fixed cost needlessly many times over). Made
+  configurable via ARGUS_INFERENCE_BATCH_SIZE (default unchanged at 100
+  so existing small-scale validation runs are unaffected); Chunk 11's
+  load test used 10,000.
 
 ## File Map
 - `docs/` — `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` holds chunk1_data_eda_summary.md, partition_key_strategy.md, and observability_queries.md (KQL saved queries + verified TLS posture)
 - `data/` — `scripts/` holds `graph_schema.py` (shared vertex/edge schema + real-data derivation), `acquire_ieee_cis.py` (Kaggle acquisition + bundled-sample fallback), `ring_injector.py` (synthetic ring injection), `eda_report.py` (validation/EDA); `raw/` and `simulated/` are gitignored but currently populated (bundled sample + 45 injected rings) — regenerate anytime via the three scripts in order
-- `ingestion/` — real Cargo crate (11 passing tests): `src/lib.rs` (structs, `Sink` trait, SHA-256 PII masking, `azure_credential()` MI/dev chain, `fetch_pii_salt()` Key Vault fetch, `VelocityTracker` real trailing-60s window, `DeadLetter` flushed JSONL), `src/event_hub_sink.rs` (Entra auth, retry w/ backoff), `src/main.rs` (`ARGUS_MODE=service` for the deployed container; `ARGUS_SINK=eventhub`, `ARGUS_EVENT_LIMIT`), `examples/eventhub_validate.rs`, `Dockerfile` + `.dockerignore` (multi-stage, 141MB, non-root)
-- `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction) and `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- inference loads these); `inference/` holds `inference_service.py` (Event Hubs consumer -> incremental state -> GNN scoring -> Cosmos write-back, `--validate` for post-run checks) + `prepare_validation_events.py`. NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
+- `ingestion/` — real Cargo crate (11 passing tests): `src/lib.rs` (structs, `Sink` trait, SHA-256 PII masking, `azure_credential()` MI/dev chain, `fetch_pii_salt()` Key Vault fetch, `VelocityTracker` real trailing-60s window, `DeadLetter` flushed JSONL, `LatencyRecorder` real per-event/per-batch timing added Chunk 11), `src/event_hub_sink.rs` (Entra auth, Chunk 11: internal batching via create_batch/try_add_event_data/send_batch -- real throughput fix, ~15 evt/s -> 14,675-15,151 evt/s -- `Sink` trait interface unchanged), `src/main.rs` (`ARGUS_MODE=service` for the deployed container; `ARGUS_SINK=eventhub`, `ARGUS_EVENT_LIMIT`, `ARGUS_MEASURE_LATENCY`), `examples/eventhub_validate.rs`, `Dockerfile` + `.dockerignore` (multi-stage, 141MB, non-root)
+- `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction), `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export), and `eval_full_scale.py` (Chunk 11: reuses train_gnn.py's exact eval_split/ring_component_split to evaluate against ALL known ring labels, not just the held-out test split -- directly comparable numbers); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- inference loads these); `inference/` holds `inference_service.py` (Event Hubs consumer -> incremental state -> GNN scoring -> Cosmos write-back, `--validate` for post-run checks, `ARGUS_INFERENCE_BATCH_SIZE` added Chunk 11) + `prepare_validation_events.py`. NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
 - `agents/` — `compliance_graph.py` (real LangGraph StateGraph: NetworkTracer w/ live Gremlin traversals, BehavioralAnalyst w/ real transaction metrics, SARGenerator w/ real Foundry LLM call, groundedness guardrail w/ conditional retry edge), `orchestrator.py` (Cosmos cross-query discovery of flagged accounts -> pipeline -> SAR stored on vertex), `requirements.txt`. Runs on global Python (no torch needed)
 - `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation; `--validate` for checks only, `--add-ring-owns` for the targeted OWNS-edge fix; auth via `DefaultAzureCredential` + Gremlin RBAC, no account key) + `requirements.txt` (gremlinpython, azure-identity)
 - `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
 - `dashboards/` — `export_tableau_extract.py` (Gremlin + transaction queries flattened to `extracts/argus_tableau_extract.csv|parquet`, gitignored; rerun = refresh), `argus_fraud_dashboard.twb` (hand-authored workbook, three PDD section 3 calculated fields, needs visual check in Tableau Desktop)
-- `tests/` — `unit/`, `integration/`, `load/` scaffolded, empty
+- `tests/` — `unit/`, `integration/` scaffolded, empty; `load/eventhub_marker.py` (Chunk 11: marker-based test isolation -- capture per-partition sequence numbers before a run, count only events after)
 - `.github/workflows/` — `build-ingestion-image.yml` (CI image build+push to GHCR with the workflow's GITHUB_TOKEN; triggers on ingestion/** changes or manual dispatch)
 - Root — `README.md`, `LICENSE` (MIT), `.gitignore`, `context.md` (this file)
 
@@ -1018,5 +1095,144 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   push on unilaterally). The prior Known-Issue bullet about the public
   GHCR package is removed below since ACR is now the live pull path
   regardless of GHCR's current state.
+- 2026-07-12 — Claude Code — Chunk 11 — Load testing & SLO validation.
+  STEP 0 KEDA FINDING (confirmed real, not a false alarm): the Chunk 10
+  scale rule scales argus-ingestion (the PRODUCER) on backlog in the hub
+  it produces INTO. Backlog = production rate minus consumption rate; if
+  a real downstream consumer is lagging, adding producer capacity doesn't
+  relieve that backlog, it can only add to it -- and even setting that
+  aside, this producer is a single serial file-replay job with no
+  partitionable work, so extra replicas wouldn't add real throughput
+  anyway. CONFIRMED LIVE during this chunk's own load test: sending
+  traffic from a local binary (not the deployed app) caused
+  argus-ingestion to scale 0->2 replicas anyway, doing nothing to drain
+  the backlog it scaled in response to. Also checked
+  ml/inference/inference_service.py's consumer: NO checkpoint store at
+  all (starting_position="@latest", in-memory only), so the same
+  "counts everything as backlog" gap Chunk 10 flagged exists on the
+  consumer side too. Correct fix (proposed, NOT implemented -- a real
+  deployment + code change, not a config tweak, so out of this chunk's
+  scope per instruction): containerize inference_service.py as its own
+  Container App, move the KEDA azure-eventhub rule there scaling on ITS
+  OWN consumer-group lag, and add a real checkpoint store (the existing
+  keda-checkpoints storage account could hold it) so the lag signal is
+  accurate. Logged as a dedicated Known Issue, not silently deferred.
+  STEP 1: tests/load/eventhub_marker.py -- captures per-partition
+  sequence numbers before a test run, counts only events after that
+  marker. Verified against the live hub (capture-then-immediate-count
+  returned 0, as expected) before relying on it.
+  STEP 2 SCALING PLAN (shown, approved, applied): verified live via the
+  Retail Prices API that Standard Throughput Unit = $0.03/hour and
+  Standard Ingress Events = $0.028/1M (a real separate charge, Standard
+  tier is "pay per million events" per Microsoft's own tier-comparison
+  table, unlike Premium/Dedicated where it's included) -- NOT assumed.
+  Verified our ~250-260-byte enriched payload means the events/sec cap
+  binds before the MB/s cap, so 10 TUs is the real minimum for
+  10,000 events/sec; provisioned 12 (2 TUs headroom) via a new, narrow,
+  reversible override variable (load_test_eventhub_capacity), NOT a
+  tier switch to "enterprise" (that would also touch Cosmos throughput/
+  multi-region/autopilot, none of which this test needed). Partition
+  count (2) was NOT touched and has no override variable at all --
+  verified via Microsoft's Event Hubs FAQ that Standard-tier partitions
+  are flatly immutable (not "irreversible if changed," literally not a
+  supported operation; only Premium/Dedicated support it, at ~34x/~228x
+  the per-unit cost) -- flagged explicitly per the chunk's instruction,
+  not proposed. max_replicas bumped 1->5 (also via a narrow override
+  variable) since a single 0.25-vCPU replica's real throughput ceiling
+  was untested at this scale. Terraform plan shown before applying
+  (0 to add, 2 to change, 0 to destroy both times) -- exact go-ahead
+  given before the apply.
+  STEP 3 THROUGHPUT & INGESTION LATENCY -- a real, serious bug found and
+  fixed, not glossed over: the FIRST full-corpus attempt (590,860 real
+  events, real Rust engine, real EventHubSink, real Event Hubs) achieved
+  only ~15 events/sec and consumed 6.3+ GB of RAM before being killed.
+  Root cause, verified against the crate's own source (not assumed):
+  `send_event` does one AMQP round trip per event with no batching, and
+  the ingestion loop spawns one tokio task per event with no concurrency
+  cap -- under real load this serializes on the connection and piles up
+  unboundedly in memory. Fix: EventHubSink now internally batches
+  (create_batch/try_add_event_data/send_batch, a real API confirmed in
+  the crate source) behind the SAME per-event Sink trait -- callers are
+  unaffected, batching is an internal implementation detail. This is a
+  legitimate fix needed to get a MEANINGFUL measurement at all, not scope
+  creep: at 15 events/sec the "measurement" would have been an artifact
+  of a broken client, not a real reading of the pipeline's capability.
+  Result, run twice for reproducibility against the real 590,860-row
+  corpus: 14,674.7 events/sec then 15,150.7 events/sec -- REAL, EXCEEDS
+  the PDD's 10,000/sec target. Zero dead-lettered events across both
+  runs (1,181,720 total events sent this session). Latency: added real
+  per-event (LatencyRecorder, in lib.rs) AND per-batch
+  (EventHubSink's own recorder) instrumentation -- true wall-clock
+  timing, not amortized. Two honestly-disentangled numbers, because they
+  answer different questions: LATENCY-BATCH (the real send_batch round
+  trip alone) mean ~170-174ms / p95 ~198-225ms / p99 ~1,837-1,841ms;
+  LATENCY-FULL (includes client-side queueing, since the batch_loop
+  dispatches batches sequentially rather than pipelining several
+  concurrently) mean ~16.6-17.7s / p95 ~30.3-31.5s / p99 ~32.5-33.3s.
+  Both numbers, even the more favorable one, are well above the PDD's
+  <45ms ingestion latency target -- reported as a FAIL, not softened.
+  The sequential (non-pipelined) batch dispatch is a further, separate
+  latency-improvement opportunity, logged in Known Issues rather than
+  fixed now (time-boxed; the batching fix above was necessary to get a
+  valid throughput number at all, this second one is a refinement).
+  STEP 4 FULL-SCALE GNN INFERENCE -- ran the REAL inference service
+  live and concurrently against a fresh full-corpus producer run (not a
+  toy 400-event validation), so it consumed genuine full-scale volume
+  in real time. Found the hardcoded max_batch_size=100 would have taken
+  an estimated 16+ hours to drain 590K events (the full-graph forward
+  pass costs ~6.5-17s basically regardless of batch event count, so a
+  100-event batch means ~5,900 forward passes) -- made batch size
+  configurable (ARGUS_INFERENCE_BATCH_SIZE) and reran at 10,000, a
+  legitimate fix to make a full-scale test tractable, not a shortcut
+  around measuring it. Captured 27 real batches / 81,609 real events
+  before stopping (each batch already exercises the complete 40,289-
+  node/2.682M-edge graph regardless of event count -- more batches
+  would repeat the same cost pattern, not reveal new information).
+  Reported honestly, two numbers that must be read together: PER-BATCH
+  latency (what any individual event's score genuinely isn't available
+  until) mean 21.96s / p95 34.08s / p99 34.19s -- FAILS the <300ms
+  target badly, even in the best observed case (~9s). PER-EVENT
+  amortized (batch total / event count) mean 8.07ms / p95 16.80ms /
+  p99 18.65ms -- clears <300ms, but ONLY because these batches happened
+  to be large; a lone event arriving in a quiet window would still wait
+  the full per-batch time, not 8ms. Verdict: FAIL for the SLO as
+  written, because the amortized number is conditional on sustained
+  high-volume batching and doesn't reflect what an isolated event
+  experiences -- reporting a PASS off the amortized number alone would
+  be exactly the "metric looks good for the wrong reason" mistake this
+  project has committed to catching (the empty-draft/vacuous-guardrail
+  precedent from Chunk 8).
+  STEP 5 FULL-SCALE MODEL EVALUATION (ml/training/eval_full_scale.py,
+  reuses train_gnn.py's exact eval_split/ring_component_split code so
+  the numbers are directly comparable, not reimplemented): recomputed
+  test-split numbers matched Chunk 6 exactly (precision 1.000, recall
+  0.8235, F1 0.9032, PR-AUC 0.9966, FP-rate 0.000, 42 TP/0 FP/9 FN/
+  7996 TN) confirming reproducibility. FULL GRAPH (every known ring
+  label -- train+val+test combined, 315 positives / 40,289 nodes):
+  precision 1.000 (unchanged), recall improves to 0.9016 (284 TP/31 FN --
+  expected, since this includes the 60%+20% of rings the model has
+  actually seen), F1 0.9482, PR-AUC 0.9971, FP-rate STILL 0.000 (0 FP /
+  39,974 TN). Honest read: full-scale doesn't reveal a hidden weakness
+  the held-out split missed -- precision and FP-rate hold at the same
+  perfect level at 76x the positive-label volume, which is a genuinely
+  stronger reproducibility signal than the smaller test split alone,
+  while the caveat from Chunk 6 stands unchanged (these are structurally
+  conspicuous synthetic rings; this validates the pipeline, not
+  real-world fraud performance).
+  STEP 6 REVERT: TU 12->1, max_replicas 5->1, shown as a plan
+  (0 add / 2 change / 0 destroy) and applied without waiting on
+  approval per the chunk's own instruction (cost-reducing). Verified
+  live post-revert (capacity=1, maxReplicas=1). Partition count was
+  never touched, so nothing there to revert.
+  STEP 7 SLO SCORECARD -- see below (Known Issues) and this session's
+  final chat summary for the full table; in brief: throughput PASS
+  (~14,675-15,151 vs 10,000 events/sec target), ingestion latency FAIL
+  (best case ~170-174ms mean vs <45ms target), inference latency FAIL
+  (per-batch 22s mean vs <300ms target; amortized 8ms mean clears it but
+  is conditional, not the true per-event experience), false-positive
+  rate PASS (0.000% vs <2.5% target, full graph scale). 2 of 4 PDD SLOs
+  pass as literally measured; the two misses are both real, both
+  understood (root cause known, not a mystery), and both have a
+  concrete -- if not-yet-implemented -- path down.
 
-Last updated: 2026-07-11 by Claude Code
+Last updated: 2026-07-12 by Claude Code

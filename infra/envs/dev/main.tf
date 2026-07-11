@@ -55,7 +55,7 @@ module "event_hubs" {
   location            = azurerm_resource_group.this.location
 
   sku                    = local.cfg.eventhub_sku
-  capacity               = local.cfg.eventhub_capacity
+  capacity               = coalesce(var.load_test_eventhub_capacity, local.cfg.eventhub_capacity)
   partition_count        = local.cfg.eventhub_partition_count
   message_retention_days = local.cfg.eventhub_retention_days
 

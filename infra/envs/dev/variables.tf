@@ -34,6 +34,32 @@ variable "tier" {
   }
 }
 
+# -----------------------------------------------------------------------------
+# CHUNK 11 LOAD-TEST OVERRIDES
+#
+# Narrow, single-purpose, fully reversible overrides for the load test --
+# deliberately NOT a tier switch to "enterprise" (that would also change
+# Cosmos throughput/multi-region/autopilot, none of which this test needs).
+# Null = use the tier default. Set via -var or a gitignored .auto.tfvars for
+# the test window, then unset back to null to revert (Step 6).
+#
+# partition_count has NO override here on purpose: Standard tier partitions
+# are immutable (Microsoft Learn FAQ, confirmed 2026-07-12) -- there is no
+# Terraform variable that could express a reversible change even if one were
+# wanted, so none is offered.
+# -----------------------------------------------------------------------------
+variable "load_test_eventhub_capacity" {
+  type        = number
+  default     = null
+  description = "Temporary Event Hubs namespace TU override for the Chunk 11 load test. Null = tier default (1 TU)."
+}
+
+variable "load_test_max_replicas" {
+  type        = number
+  default     = null
+  description = "Temporary argus-ingestion max_replicas override for the Chunk 11 load test. Null = baseline (1)."
+}
+
 locals {
   tier_config = {
     dev = {

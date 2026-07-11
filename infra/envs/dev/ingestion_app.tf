@@ -55,7 +55,7 @@ resource "azurerm_container_app" "ingestion" {
 
   template {
     min_replicas = 0
-    max_replicas = 1
+    max_replicas = coalesce(var.load_test_max_replicas, 1)
 
     container {
       name   = "ingestion"

@@ -281,11 +281,19 @@ class InferenceService:
             credential=DefaultAzureCredential(),
         )
         print(f"[INFERENCE] consuming from {EVENTHUB_NAMESPACE}/{EVENTHUB_NAME} (new events only)...")
+        # Chunk 11: batch size is configurable (was hardcoded at 100). The
+        # forward pass cost is dominated by the graph's size (~9-12s,
+        # essentially constant regardless of how many events triggered it),
+        # so at real full-scale volume (590K+ events) a 100-event batch
+        # means ~5,900 forward passes -- ~16+ hours wall clock. A larger
+        # batch amortizes that fixed per-pass cost over far more events
+        # without changing the per-batch computation itself.
+        max_batch_size = int(os.environ.get("ARGUS_INFERENCE_BATCH_SIZE", "100"))
         worker = threading.Thread(
             target=consumer.receive_batch,
             kwargs={
                 "on_event_batch": self.on_event_batch,
-                "max_batch_size": 100,
+                "max_batch_size": max_batch_size,
                 "max_wait_time": 5,
                 "starting_position": "@latest",
             },

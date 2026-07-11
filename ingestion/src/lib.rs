@@ -289,11 +289,71 @@ impl DeadLetter {
     }
 }
 
+/// Chunk 11: real per-event send latency (true enqueue-to-ingest -- the
+/// wall-clock duration of the actual `sink.send().await` call, not an
+/// amortized batch-total/event-count approximation like Chunk 7's
+/// inference number). Gated behind an explicit opt-in
+/// (`IngestionEngine::with_latency_recorder`) so normal operation pays
+/// zero overhead for a Vec no one reads.
+pub struct LatencyRecorder {
+    samples_micros: Mutex<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LatencyStats {
+    pub count: usize,
+    pub mean_micros: f64,
+    pub p95_micros: u64,
+    pub p99_micros: u64,
+}
+
+impl LatencyRecorder {
+    pub fn new() -> Self {
+        Self {
+            samples_micros: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub async fn record(&self, micros: u64) {
+        self.samples_micros.lock().await.push(micros);
+    }
+
+    pub async fn stats(&self) -> LatencyStats {
+        let mut samples = self.samples_micros.lock().await.clone();
+        samples.sort_unstable();
+        let count = samples.len();
+        if count == 0 {
+            return LatencyStats {
+                count: 0,
+                mean_micros: 0.0,
+                p95_micros: 0,
+                p99_micros: 0,
+            };
+        }
+        let mean_micros = samples.iter().sum::<u64>() as f64 / count as f64;
+        let p95_idx = ((count as f64) * 0.95).floor() as usize;
+        let p99_idx = ((count as f64) * 0.99).floor() as usize;
+        LatencyStats {
+            count,
+            mean_micros,
+            p95_micros: samples[p95_idx.min(count - 1)],
+            p99_micros: samples[p99_idx.min(count - 1)],
+        }
+    }
+}
+
+impl Default for LatencyRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct IngestionEngine {
     sink: Arc<dyn Sink>,
     pii_salt: String,
     velocity: Arc<VelocityTracker>,
     dead_letter: Option<Arc<DeadLetter>>,
+    latency: Option<Arc<LatencyRecorder>>,
 }
 
 impl IngestionEngine {
@@ -303,11 +363,17 @@ impl IngestionEngine {
             pii_salt,
             velocity: Arc::new(VelocityTracker::new()),
             dead_letter: None,
+            latency: None,
         }
     }
 
     pub fn with_dead_letter(mut self, dead_letter: Arc<DeadLetter>) -> Self {
         self.dead_letter = Some(dead_letter);
+        self
+    }
+
+    pub fn with_latency_recorder(mut self, latency: Arc<LatencyRecorder>) -> Self {
+        self.latency = Some(latency);
         self
     }
 
@@ -349,9 +415,15 @@ impl IngestionEngine {
         let payload = serde_json::to_string(&enriched)?;
         let sink = Arc::clone(&self.sink);
         let dead_letter = self.dead_letter.clone();
+        let latency = self.latency.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = sink.send(&payload).await {
+            let start = std::time::Instant::now();
+            let result = sink.send(&payload).await;
+            if let Some(lat) = &latency {
+                lat.record(start.elapsed().as_micros() as u64).await;
+            }
+            if let Err(e) = result {
                 eprintln!("[INGESTION ERROR] Failed to forward to sink: {e}");
                 if let Some(dl) = dead_letter {
                     dl.write(&payload, &e.to_string()).await;

@@ -9,24 +9,51 @@
 //! context.md's Architectural Decisions Log for what differed from
 //! expectations (`DeveloperToolsCredential` replacing the
 //! `DefaultAzureCredential` name older SDK generations used).
+//!
+//! Chunk 11 addition: internal batching. `send_event` (one event, one AMQP
+//! round trip) was the whole story through Chunk 10's validation runs
+//! (a few thousand events at a time), which never surfaced a problem. At
+//! real load (the 590K-row corpus, target 10,000 events/sec) it fell over
+//! hard -- ~15 events/sec, 6+ GB of resident memory from unbounded spawned
+//! tasks queuing on a single connection's sender. Found empirically (not
+//! assumed): the crate has a real batch API (`create_batch` /
+//! `try_add_event_data` / `send_batch`, confirmed in its own source), which
+//! amortizes the AMQP round trip over many events instead of paying it once
+//! per event. The public `Sink::send` contract (one payload in, one
+//! `Result` out) is unchanged -- batching is an internal implementation
+//! detail: callers' payloads are queued, grouped by a short time/size
+//! window, sent as one `EventDataBatch`, and each caller's `Result` resolves
+//! once its batch lands.
 
-use crate::{azure_credential, Sink, SinkError};
+use crate::{azure_credential, LatencyRecorder, Sink, SinkError};
 use async_trait::async_trait;
 use azure_core::time::Duration as AzureDuration;
-use azure_messaging_eventhubs::{ProducerClient, RetryOptions, SendEventOptions};
+use azure_messaging_eventhubs::{EventDataBatchOptions, ProducerClient, RetryOptions};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
+use tokio::sync::{mpsc, oneshot};
 
-/// Attempts around the `send_event` call itself, on top of (not instead of)
-/// the SDK's own internal `RetryOptions` -- this is Chunk 4's "basic
-/// transient-error retry" requirement: a few attempts with exponential
-/// backoff at the Sink layer, since this now talks to a real network.
-/// `RetryOptions` below governs the SDK's own AMQP link/connection recovery,
-/// a separate, lower layer.
+/// Attempts around the batch send itself, on top of (not instead of) the
+/// SDK's own internal `RetryOptions` -- see the module doc for the split
+/// between this Sink-layer retry and the SDK's own AMQP link/connection
+/// recovery.
 const SEND_MAX_ATTEMPTS: u32 = 3;
 const SEND_INITIAL_BACKOFF: StdDuration = StdDuration::from_millis(200);
 
+/// Batching window: gather whatever arrives within this much wall time (or
+/// until a batch fills, whichever first) before flushing. Small enough that
+/// a lone event under light load still moves in ~10ms, large enough that
+/// sustained high-rate traffic gets real amortization (hundreds of ~250-300
+/// byte events comfortably fit in one Standard-tier message envelope).
+const BATCH_WINDOW: StdDuration = StdDuration::from_millis(10);
+
+struct BatchItem {
+    payload: String,
+    reply: oneshot::Sender<Result<(), SinkError>>,
+}
+
 pub struct EventHubSink {
-    producer: ProducerClient,
+    tx: mpsc::UnboundedSender<BatchItem>,
 }
 
 impl EventHubSink {
@@ -39,6 +66,23 @@ impl EventHubSink {
     /// implementations, so nothing else in this sink changes between
     /// environments.
     pub async fn new(namespace_hostname: &str, eventhub_name: &str) -> Result<Self, SinkError> {
+        Self::new_with_batch_latency_recorder(namespace_hostname, eventhub_name, None).await
+    }
+
+    /// Same as `new`, plus an optional recorder for BATCH-level round-trip
+    /// time (the `send_batch` call itself, excluding client-side queueing).
+    /// Chunk 11: under real concurrent load, the per-event latency
+    /// `IngestionEngine`/`LatencyRecorder` measures includes time spent
+    /// queued behind other in-flight batches -- genuinely part of real
+    /// end-to-end latency under load, but easy to mistake for the network/
+    /// broker's own latency if that's the only number reported. This
+    /// second recorder disentangles the two so both can be reported
+    /// honestly instead of picking one framing.
+    pub async fn new_with_batch_latency_recorder(
+        namespace_hostname: &str,
+        eventhub_name: &str,
+        batch_latency: Option<Arc<LatencyRecorder>>,
+    ) -> Result<Self, SinkError> {
         let credential = azure_credential()
             .map_err(|e| SinkError(format!("failed to build Azure AD credential: {e}")))?;
 
@@ -54,40 +98,151 @@ impl EventHubSink {
             .await
             .map_err(|e| SinkError(format!("failed to open Event Hubs producer: {e}")))?;
 
-        Ok(Self { producer })
+        let producer = Arc::new(producer);
+        let (tx, rx) = mpsc::unbounded_channel::<BatchItem>();
+        tokio::spawn(Self::batch_loop(producer, rx, batch_latency));
+
+        Ok(Self { tx })
+    }
+
+    async fn batch_loop(
+        producer: Arc<ProducerClient>,
+        mut rx: mpsc::UnboundedReceiver<BatchItem>,
+        batch_latency: Option<Arc<LatencyRecorder>>,
+    ) {
+        loop {
+            let Some(first) = rx.recv().await else {
+                break; // sender side (the EventHubSink) was dropped
+            };
+            let mut items = vec![first];
+
+            let window = tokio::time::sleep(BATCH_WINDOW);
+            tokio::pin!(window);
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe_item = rx.recv() => {
+                        match maybe_item {
+                            Some(item) => items.push(item),
+                            None => break,
+                        }
+                    }
+                    _ = &mut window => break,
+                }
+            }
+
+            Self::flush(&producer, items, batch_latency.as_ref()).await;
+        }
+    }
+
+    /// Packs `items` into as many `EventDataBatch`es as needed (one, almost
+    /// always, at these payload sizes) and sends each with the Sink-layer
+    /// retry. Every item gets a reply either way -- no caller is left
+    /// hanging on a dropped oneshot.
+    async fn flush(
+        producer: &Arc<ProducerClient>,
+        items: Vec<BatchItem>,
+        batch_latency: Option<&Arc<LatencyRecorder>>,
+    ) {
+        let mut items = items.into_iter().peekable();
+        while items.peek().is_some() {
+            let mut batch = match producer.create_batch(Some(EventDataBatchOptions::default())).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let msg = format!("failed to create batch: {e}");
+                    for item in items {
+                        let _ = item.reply.send(Err(SinkError(msg.clone())));
+                    }
+                    return;
+                }
+            };
+
+            let mut in_this_batch = Vec::new();
+            while let Some(item) = items.peek() {
+                match batch.try_add_event_data(item.payload.clone(), None) {
+                    Ok(true) => {
+                        in_this_batch.push(items.next().unwrap());
+                    }
+                    Ok(false) => break, // batch full; remainder starts a new one
+                    Err(e) => {
+                        let item = items.next().unwrap();
+                        let _ = item
+                            .reply
+                            .send(Err(SinkError(format!("event rejected from batch: {e}"))));
+                    }
+                }
+            }
+
+            if batch.is_empty() {
+                continue;
+            }
+
+            let mut attempt = 0u32;
+            let mut backoff = SEND_INITIAL_BACKOFF;
+            let send_start = std::time::Instant::now();
+            let result = loop {
+                match producer.send_batch(batch, None).await {
+                    Ok(()) => break Ok(()),
+                    Err(_) if attempt + 1 < SEND_MAX_ATTEMPTS => {
+                        attempt += 1;
+                        eprintln!(
+                            "[EVENTHUB_SINK] batch send failed (attempt {attempt}/{SEND_MAX_ATTEMPTS}) -- retrying in {backoff:?}"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                        // EventDataBatch isn't Clone/reusable after a failed
+                        // send attempt in this API -- rebuild it from the
+                        // same payloads for the retry.
+                        let rebuilt = match producer
+                            .create_batch(Some(EventDataBatchOptions::default()))
+                            .await
+                        {
+                            Ok(b) => b,
+                            Err(e) => break Err(format!("failed to rebuild batch for retry: {e}")),
+                        };
+                        for item in &in_this_batch {
+                            let _ = rebuilt.try_add_event_data(item.payload.clone(), None);
+                        }
+                        batch = rebuilt;
+                        continue;
+                    }
+                    Err(e) => break Err(format!("batch send failed after {SEND_MAX_ATTEMPTS} attempts: {e}")),
+                }
+            };
+
+            if let Some(lat) = batch_latency {
+                lat.record(send_start.elapsed().as_micros() as u64).await;
+            }
+
+            match result {
+                Ok(()) => {
+                    for item in in_this_batch {
+                        let _ = item.reply.send(Ok(()));
+                    }
+                }
+                Err(msg) => {
+                    for item in in_this_batch {
+                        let _ = item.reply.send(Err(SinkError(msg.clone())));
+                    }
+                }
+            }
+        }
     }
 }
 
 #[async_trait]
 impl Sink for EventHubSink {
     async fn send(&self, payload: &str) -> Result<(), SinkError> {
-        let mut attempt = 0u32;
-        let mut backoff = SEND_INITIAL_BACKOFF;
-        loop {
-            let result = self
-                .producer
-                .send_event(
-                    payload.to_string(),
-                    Some(SendEventOptions { partition_id: None }),
-                )
-                .await;
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(BatchItem {
+                payload: payload.to_string(),
+                reply,
+            })
+            .map_err(|_| SinkError("EventHubSink batch loop is no longer running".to_string()))?;
 
-            match result {
-                Ok(()) => return Ok(()),
-                Err(e) if attempt + 1 < SEND_MAX_ATTEMPTS => {
-                    attempt += 1;
-                    eprintln!(
-                        "[EVENTHUB_SINK] send failed (attempt {attempt}/{SEND_MAX_ATTEMPTS}): {e} -- retrying in {backoff:?}"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff *= 2;
-                }
-                Err(e) => {
-                    return Err(SinkError(format!(
-                        "send_event failed after {SEND_MAX_ATTEMPTS} attempts: {e}"
-                    )));
-                }
-            }
-        }
+        reply_rx
+            .await
+            .map_err(|_| SinkError("EventHubSink batch loop dropped the reply".to_string()))?
     }
 }
