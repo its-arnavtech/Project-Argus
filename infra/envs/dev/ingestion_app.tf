@@ -44,7 +44,10 @@ resource "azurerm_container_app" "ingestion" {
 
   # Chunk 10 addendum: pulled from ACR via the app's own system identity
   # (AcrPull, granted in container_registry.tf) -- no admin credentials,
-  # no public image.
+  # no public image. NOTE: app_acr_pull's principal_id references this
+  # resource's own identity, so a depends_on in the other direction would
+  # be a graph cycle -- ordering for the first-time bootstrap is handled
+  # via a targeted apply (role assignment first), not an HCL dependency.
   registry {
     server   = azurerm_container_registry.this.login_server
     identity = "System"

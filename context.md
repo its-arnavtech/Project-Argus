@@ -546,7 +546,8 @@ Azure subscription: "Azure subscription 1" (subscription ID redacted -- see loca
 - Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU, event hub `transactions`, 2 partitions, 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
 - Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (still $0). LOADED: 5,387 vertices (1,853 Account / 1,853 Customer / 102 Device / 1,530 IPAddress / 49 Merchant) + 7,182 edges (1,380 FT / 1,580 AF / 831 UD / 1,538 SA / 1,853 OWNS, now 1:1 with every loaded account) -- the representative subset, not the full corpus. RBAC: "Cosmos DB Gremlin Built-in Data Contributor" on `argus-graph-container` for the current az CLI identity (role assignment id `fea56381-280f-4482-8619-1eb6e0933ed1`) -- **not Terraform-tracked** (azurerm has no native resource for this preview API yet; see Architectural Decisions Log). Both `graph/loader.py` and `ml/inference/inference_service.py` authenticate via this grant + `DefaultAzureCredential`, no account key.
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- holds `argus-pii-salt` (Chunk 10), the only secret this build genuinely needs stored (everything else is Entra-token auth).
-- Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law`. DEPLOYED (Chunk 10): Container App `argus-ingestion` (image `ghcr.io/its-arnavtech/argus-ingestion:chunk10`, CI-built via GitHub Actions, public package; 0.25 vCPU/0.5Gi, min 0 / max 1 replicas, KEDA azure-eventhub rule `eventhub-lag` @ 500-event threshold, MI-authenticated). System-assigned MI principal `19b38309-28e1-4e2c-8bf2-2092f9fd8bcd` with: EH Data Sender + Receiver (namespace), Key Vault Secrets User, Storage Blob Data Reader (checkpoints), Gremlin Data Contributor (anticipatory, unused today). Console logs flow to `argus-dev-law` via the environment's log-analytics binding; saved KQL queries in docs/architecture/observability_queries.md
+- Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law`. DEPLOYED (Chunk 10, image source updated in the addendum): Container App `argus-ingestion` (image `acrargusdevto614f.azurecr.io/argus-ingestion:chunk10`, pulled via the app's own managed identity/AcrPull -- built+pushed to GHCR by CI, then `az acr import`'d into ACR; 0.25 vCPU/0.5Gi, min 0 / max 1 replicas, KEDA azure-eventhub rule `eventhub-lag` @ 500-event threshold, MI-authenticated). System-assigned MI principal `19b38309-28e1-4e2c-8bf2-2092f9fd8bcd` with: EH Data Sender + Receiver (namespace), Key Vault Secrets User, Storage Blob Data Reader (checkpoints), AcrPull (registry), Gremlin Data Contributor (anticipatory, unused today). Console logs flow to `argus-dev-law` via the environment's log-analytics binding; saved KQL queries in docs/architecture/observability_queries.md
+- Container Registry: `acrargusdevto614f` (Basic SKU, ~$5/mo, admin_enabled=false -- RBAC/MI pull only). Sole current image: `argus-ingestion:chunk10`.
 - Storage account `stargusdevto614f` (Standard LRS, ~$0/mo) -- sole purpose: KEDA azure-eventhub checkpoint container `keda-checkpoints`
 - Key Vault secret `argus-pii-salt` -- the production PII salt (Chunk 10); fetched at startup by the ingestion service via MI, by local dev via az CLI identity
 - TWO-IDENTITY MODEL (Chunk 10): dev = az CLI identity (EH Sender/Receiver, Gremlin Data Contributor, Cognitive Services User, KV Secrets Officer) for local scripts/agents; prod = argus-ingestion's system MI (grants above). Both deliberate, neither replaces the other; all Gremlin grants now Terraform-tracked via azapi (untracked-grant gap closed by state import)
@@ -626,16 +627,16 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   is unused, anticipatory, and flagged rather than silently
   over-provisioned. Revisit if/when the ingestion engine ever writes to
   the graph directly.
-- SUPERSEDING IN PROGRESS: the GHCR package `argus-ingestion` is
-  currently PUBLIC (anonymous pull, so Container Apps could fetch it
-  without a stored registry credential). Reconsidered in the Chunk 10
-  addendum session as inconsistent with this project's no-public-
-  exposure pattern -- an ACR migration (managed-identity pull, no public
-  image) is planned and its Terraform plan is saved
-  (tfplan_chunk10_addendum) but NOT YET APPLIED, awaiting go-ahead. Once
-  applied and confirmed working, the GHCR package should be flipped back
-  to private/deleted -- this bullet should be removed at that point, not
-  left stale.
+- RESOLVED 2026-07-11 (Chunk 10 addendum): the ingestion service now
+  pulls from Azure Container Registry (acrargusdevto614f) via its own
+  managed identity (AcrPull RBAC, no admin credentials) instead of the
+  public-GHCR workaround -- verified live (provisioningState Succeeded,
+  clean startup logs). GHCR's `argus-ingestion` package now appears
+  private (anonymous pull returns 404 as of this session, not
+  independently confirmed who/what changed it) and is no longer the
+  deployed app's pull source either way; the CI workflow still pushes
+  there as a build artifact/cache, which is fine now that nothing
+  depends on it being public.
 - The CI workflow (build-ingestion-image.yml) builds and pushes the
   image but does NOT run `cargo test`/`cargo clippy` first -- those were
   run manually this session (11/11 passing, clean) but aren't yet a CI
@@ -981,5 +982,41 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   checkpointing consumer), first verify all partitions report
   `is_empty=true` -- or explicitly net out the pre-existing count --
   before measuring "time to scale from empty."
+- 2026-07-11 — Claude Code — Chunk 10 ADDENDUM RESOLVED: ACR migration
+  applied and verified live. `az acr import` copied the image straight
+  from the (still-public) GHCR package into acrargusdevto614f -- no
+  Docker Desktop needed for the one-time copy. Two real bugs hit and
+  fixed during apply, both honestly documented rather than brute-forced
+  past: (1) the first apply tried to update the container app's image
+  AND create the AcrPull role assignment in the same operation with no
+  dependency between them; the app update failed (image didn't exist in
+  ACR yet on attempt 1, then a real RBAC-propagation race on attempt 2)
+  and aborted before the role assignment ever landed in state. Adding a
+  `depends_on` from the container app to the role assignment was
+  attempted but rejected -- it creates a graph CYCLE, since the role
+  assignment's principal_id already references the container app's
+  identity in the other direction. Fix: created the AcrPull grant
+  directly via `az rest` (the `az role assignment` CLI subcommand itself
+  turned out to be broken on this machine's az-cli 2.87.0 install --
+  `--scope` reproducibly fails with a bogus MissingSubscription error
+  even against known-good resources; routed around it with a raw ARM
+  PUT, same API Terraform uses), then `terraform import`'d it into state
+  so the next apply saw it as already-satisfied. (2) Git Bash's MSYS
+  path-conversion mangled the leading `/subscriptions/...` of the import
+  ID into a Windows path -- fixed with MSYS_NO_PATHCONV=1, the same
+  workaround this project already uses for `docker run` volume mounts.
+  End state, verified live: argus-ingestion's active image is
+  `acrargusdevto614f.azurecr.io/argus-ingestion:chunk10`,
+  provisioningState Succeeded, runningStatus Running, logs confirm a
+  clean start (Key Vault salt fetched, correct sink) -- MI-based ACR
+  pull works end-to-end. GHCR anonymous pull, which returned HTTP 200
+  earlier in this same session, now returns 404 -- the package appears
+  to already be private (no tool call in this session changed its
+  visibility; either the user did it directly or GitHub's behavior
+  changed some other way -- not independently confirmed, and flipping
+  package visibility is an account-settings change this agent won't
+  push on unilaterally). The prior Known-Issue bullet about the public
+  GHCR package is removed below since ACR is now the live pull path
+  regardless of GHCR's current state.
 
 Last updated: 2026-07-11 by Claude Code
