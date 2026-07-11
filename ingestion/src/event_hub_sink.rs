@@ -31,7 +31,7 @@ use azure_core::time::Duration as AzureDuration;
 use azure_messaging_eventhubs::{EventDataBatchOptions, ProducerClient, RetryOptions};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 
 /// Attempts around the batch send itself, on top of (not instead of) the
 /// SDK's own internal `RetryOptions` -- see the module doc for the split
@@ -46,6 +46,25 @@ const SEND_INITIAL_BACKOFF: StdDuration = StdDuration::from_millis(200);
 /// sustained high-rate traffic gets real amortization (hundreds of ~250-300
 /// byte events comfortably fit in one Standard-tier message envelope).
 const BATCH_WINDOW: StdDuration = StdDuration::from_millis(10);
+
+/// Post-Chunk-11 fix: batches are now dispatched CONCURRENTLY (pipelined),
+/// bounded by this many in flight at once -- Chunk 11 measured that
+/// sequential dispatch (one batch awaited at a time) was the dominant
+/// latency cost: at ~170ms round trip it caps at ~6 batches/sec, so under
+/// full-corpus load events queued 16-17 SECONDS client-side before their
+/// batch even started sending. Why 8: sustaining Chunk 11's measured
+/// ~15,000 events/sec at the observed ~3,200-event batch size needs ~5
+/// batches/sec; 8 in flight raises the dispatch ceiling to ~47/sec (mean
+/// RTT) -- ample headroom without approximating the unbounded task spawn
+/// that caused Chunk 11's 6GB memory blowup. Bounded via Semaphore, so
+/// when all permits are taken the gather loop itself backpressures
+/// naturally instead of piling up in-flight sends. Tradeoff, stated
+/// honestly: batches may now complete out of order, so cross-batch event
+/// ordering is no longer guaranteed -- nothing downstream depends on
+/// cross-event ordering (velocity is computed at ingest time, inference
+/// applies events commutatively), and Event Hubs partitions never
+/// guaranteed cross-partition order anyway.
+const MAX_IN_FLIGHT_BATCHES: usize = 8;
 
 struct BatchItem {
     payload: String,
@@ -110,6 +129,7 @@ impl EventHubSink {
         mut rx: mpsc::UnboundedReceiver<BatchItem>,
         batch_latency: Option<Arc<LatencyRecorder>>,
     ) {
+        let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_BATCHES));
         loop {
             let Some(first) = rx.recv().await else {
                 break; // sender side (the EventHubSink) was dropped
@@ -131,7 +151,20 @@ impl EventHubSink {
                 }
             }
 
-            Self::flush(&producer, items, batch_latency.as_ref()).await;
+            // Acquire a permit BEFORE spawning: when MAX_IN_FLIGHT_BATCHES
+            // sends are already outstanding, this gather loop blocks here,
+            // which is the backpressure. acquire_owned can only fail if the
+            // semaphore is closed, which never happens here.
+            let permit = Arc::clone(&in_flight)
+                .acquire_owned()
+                .await
+                .expect("in-flight semaphore closed unexpectedly");
+            let producer = Arc::clone(&producer);
+            let batch_latency = batch_latency.clone();
+            tokio::spawn(async move {
+                Self::flush(&producer, items, batch_latency.as_ref()).await;
+                drop(permit);
+            });
         }
     }
 

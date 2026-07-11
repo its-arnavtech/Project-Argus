@@ -110,8 +110,12 @@ variable "alert_email" {
 }
 
 variable "budget_amount" {
-  type    = number
-  default = 75
+  type = number
+  # Raised 75 -> 100 (post-Chunk-11 session): the grant is ~$100 and the
+  # goal shifted from minimizing spend to meaningfully using it; the
+  # 50/75/90% notification thresholds are percentages, so they recompute
+  # to $50/$75/$90 automatically.
+  default = 100
 }
 
 variable "budget_start_date" {

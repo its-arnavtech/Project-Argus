@@ -85,6 +85,15 @@ def get_cosmos_token() -> str:
     return DefaultAzureCredential().get_token("https://cosmos.azure.com/.default").token
 
 
+# Post-Chunk-11 fix: Cosmos writes were the second-largest per-batch cost
+# (~55-90ms each, ~250/batch, SEQUENTIAL = 13-17s). gremlinpython supports
+# real concurrency (pool_size connections + submit_async, verified against
+# the installed 3.8.1's actual API, not assumed) -- 8 connections keeps
+# write concurrency bounded well under the shared 1000 RU/s pool's
+# throttling point at dev tier while cutting wall time ~8x.
+GREMLIN_POOL_SIZE = int(os.environ.get("ARGUS_GREMLIN_POOL_SIZE", "8"))
+
+
 def make_gremlin_client(token: str):
     from gremlin_python.driver import client as gclient
     from gremlin_python.driver import serializer
@@ -95,6 +104,8 @@ def make_gremlin_client(token: str):
         username=f"/dbs/{DATABASE}/colls/{GRAPH}",
         password=token,
         message_serializer=serializer.GraphSONSerializersV2d0(),
+        pool_size=GREMLIN_POOL_SIZE,
+        max_workers=GREMLIN_POOL_SIZE,
     )
 
 
@@ -109,6 +120,16 @@ class GraphState:
         self.idx = {a: i for i, a in enumerate(acct_ids)}
         self.y = y  # ground truth, used only for post-hoc sanity reporting
         self.edge_set = set(map(tuple, edge_index.T.tolist()))
+        # Post-Chunk-11 fix: the original tensors() rebuilt edge_index from
+        # `sorted(self.edge_set)` EVERY batch -- profiled at ~11.4s for the
+        # 2.68M-edge set (Python-object sort + list->ndarray), which was the
+        # real cost hiding inside Chunk 7/11's "forward=" timer (the pure
+        # model forward is ~1.04s). Edge order is irrelevant to PyG's
+        # scatter-based aggregation, so: cache the warm-start edges as a
+        # tensor once, append only NEW edges to a small list, concatenate on
+        # demand. edge_set stays as the dedup index only.
+        self.base_edge_index = torch.tensor(edge_index, dtype=torch.long)
+        self.new_edges: list[tuple[int, int]] = []
 
         self.tx_count = x[:, 0].astype(np.float64).copy()
         self.uniq_cp = x[:, 1].astype(np.float64).copy()
@@ -182,14 +203,22 @@ class GraphState:
                 self.dev_count[src] += 1
 
         if src is not None and dst is not None and src != dst:
-            self.edge_set.add((src, dst))
-            self.edge_set.add((dst, src))
+            if (src, dst) not in self.edge_set:
+                self.edge_set.add((src, dst))
+                self.new_edges.append((src, dst))
+            if (dst, src) not in self.edge_set:
+                self.edge_set.add((dst, src))
+                self.new_edges.append((dst, src))
         return affected
 
     def tensors(self):
         x = np.stack([self.tx_count, self.uniq_cp, self.var, self.dev_count], axis=1).astype(np.float32)
-        edge_index = np.array(sorted(self.edge_set), dtype=np.int64).T
-        return torch.tensor(x), torch.tensor(edge_index)
+        if self.new_edges:
+            new_ei = torch.tensor(self.new_edges, dtype=torch.long).T
+            edge_index = torch.cat([self.base_edge_index, new_ei], dim=1)
+        else:
+            edge_index = self.base_edge_index
+        return torch.tensor(x), edge_index
 
 
 class InferenceService:
@@ -212,43 +241,71 @@ class InferenceService:
 
         self.events_seen = 0
         self.latencies: list[float] = []
+        self.batch_latencies: list[float] = []
         self.scored_total = 0
+        self._receivers_ready = False
         self.stop_event = threading.Event()
         self.last_event_time = time.time()
 
     def score_and_write(self, affected: set[int], batch_t0: float) -> None:
+        t_prep0 = time.time()
         x, edge_index = self.state.tensors()
         x = (x - torch.tensor(self.mu)) / torch.tensor(self.sigma)
+        t_fwd0 = time.time()
         with torch.no_grad():
             prob1 = self.model(x, edge_index).exp()[:, 1].numpy()
         t_forward = time.time()
 
-        writes = 0
+        # Post-Chunk-11 fix: concurrent writes via submit_async over the
+        # client's connection pool (was: strictly sequential .result() per
+        # write). Futures are gathered after all submits, so wall time is
+        # ~(writes / pool_size) round trips instead of (writes) round trips.
+        futures = []
+        ts_now = int(time.time())
         for node in affected:
             aid = self.state.acct_ids[node]
             if aid not in self.cosmos_accounts:
                 continue
-            score = float(prob1[node])
-            self.gclient.submit(
-                message=(
-                    "g.V(aid).has('partitionKey', pk)"
-                    ".property('gnn_risk_score', s).property('gnn_scored_at', ts)"
-                ),
-                bindings={"aid": aid, "pk": PARTITION_KEY_VALUE, "s": score, "ts": int(time.time())},
-            ).all().result()
+            futures.append(
+                self.gclient.submit_async(
+                    message=(
+                        "g.V(aid).has('partitionKey', pk)"
+                        ".property('gnn_risk_score', s).property('gnn_scored_at', ts)"
+                    ),
+                    bindings={
+                        "aid": aid,
+                        "pk": PARTITION_KEY_VALUE,
+                        "s": float(prob1[node]),
+                        "ts": ts_now,
+                    },
+                )
+            )
+        writes = 0
+        for fut in futures:
+            fut.result().all().result()
             writes += 1
         t_done = time.time()
         self.scored_total += writes
         n_events = max(len(affected) // 2, 1)
         per_event_ms = (t_done - batch_t0) / n_events * 1000
+        batch_total_s = t_done - batch_t0
         self.latencies.append(per_event_ms)
+        self.batch_latencies.append(batch_total_s)
         print(
             f"[INFERENCE] batch: {n_events} events, {len(affected)} affected nodes, "
-            f"{writes} Cosmos writes | forward={t_forward - batch_t0:.2f}s "
-            f"write={t_done - t_forward:.2f}s | amortized {per_event_ms:.0f} ms/event"
+            f"{writes} Cosmos writes | prep={t_fwd0 - t_prep0:.2f}s "
+            f"forward={t_forward - t_fwd0:.2f}s write={t_done - t_forward:.2f}s "
+            f"total={batch_total_s:.2f}s | amortized {per_event_ms:.0f} ms/event"
         )
 
     def on_event_batch(self, partition_context, events) -> None:
+        # First callback (even an empty one) proves the partition receivers
+        # are actually open -- "@latest" is pinned at receiver-open time, so
+        # anything sent before this marker would be silently skipped. Test
+        # harnesses wait for this line before producing.
+        if not self._receivers_ready:
+            self._receivers_ready = True
+            print("[INFERENCE] receivers open -- safe to start producing")
         if not events:
             if time.time() - self.last_event_time > IDLE_TIMEOUT_S and self.events_seen > 0:
                 self.stop_event.set()
@@ -312,10 +369,14 @@ class InferenceService:
 
         if self.latencies:
             lat = np.array(self.latencies)
+            blat = np.array(self.batch_latencies)
             print(
-                f"\n[INFERENCE] DONE: {self.events_seen} events, {self.scored_total} scores written | "
-                f"amortized latency mean={lat.mean():.0f}ms p95={np.percentile(lat, 95):.0f}ms per event "
-                f"(PDD directional target <300ms; formal gate is Chunk 11)"
+                f"\n[INFERENCE] DONE: {self.events_seen} events, {self.scored_total} scores written\n"
+                f"[INFERENCE] amortized per-event: mean={lat.mean():.1f}ms "
+                f"p95={np.percentile(lat, 95):.1f}ms p99={np.percentile(lat, 99):.1f}ms\n"
+                f"[INFERENCE] PER-BATCH (what a single event's score truly waits on): "
+                f"mean={blat.mean():.2f}s p95={np.percentile(blat, 95):.2f}s "
+                f"p99={np.percentile(blat, 99):.2f}s (PDD target <300ms)"
             )
 
 
