@@ -105,25 +105,61 @@ impl Sink for LocalFileSink {
 }
 
 pub const PII_SALT_ENV_VAR: &str = "ARGUS_PII_SALT";
-const DEV_FALLBACK_SALT: &str = "argus-dev-salt-CHANGE-ME";
+pub const KEY_VAULT_URL_ENV_VAR: &str = "ARGUS_KEY_VAULT_URL";
+pub const PII_SALT_SECRET_NAME: &str = "argus-pii-salt";
+const DEFAULT_KEY_VAULT_URL: &str = "https://kv-argus-dev-to614f.vault.azure.net/";
 
-/// Reads the PII hashing salt from `ARGUS_PII_SALT`. This is a placeholder
-/// today -- Chunk 10 wires it to an Azure Key Vault secret per
-/// `docs/specs/PDD_Production_Guide.md` section 5. Falls back to an
-/// obviously-fake dev salt (with a loud warning) rather than failing to
-/// start, since Chunk 2 is local-only and has no Key Vault to fall back to
-/// yet.
-pub fn pii_salt_from_env() -> String {
-    match std::env::var(PII_SALT_ENV_VAR) {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
+/// Entra credential chain shared by every Azure client in this crate:
+/// managed identity when running in Azure (Container Apps sets
+/// IDENTITY_ENDPOINT), the developer-tools chain (az CLI) locally. Both
+/// implement `TokenCredential`, so callers never care which one they got --
+/// the production/dev auth split lives entirely here.
+pub fn azure_credential() -> Result<
+    Arc<dyn azure_core::credentials::TokenCredential>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    if std::env::var("IDENTITY_ENDPOINT").is_ok() || std::env::var("MSI_ENDPOINT").is_ok() {
+        let cred: Arc<dyn azure_core::credentials::TokenCredential> =
+            azure_identity::ManagedIdentityCredential::new(None)?;
+        Ok(cred)
+    } else {
+        let cred: Arc<dyn azure_core::credentials::TokenCredential> =
+            azure_identity::DeveloperToolsCredential::new(None)?;
+        Ok(cred)
+    }
+}
+
+/// Fetches the PII hashing salt (Chunk 10, replacing Chunk 2's env-var
+/// placeholder): primary source is the Key Vault secret `argus-pii-salt`
+/// (RBAC + Entra token, no static credential), per
+/// `docs/specs/PDD_Production_Guide.md` section 5's Key Vault requirement.
+/// `ARGUS_PII_SALT` remains ONLY as an explicit local/offline override
+/// (unit tests, air-gapped dev) and says so loudly; there is no silent
+/// insecure default anymore -- no vault and no override means startup
+/// fails, which is correct for a production credential path.
+pub async fn fetch_pii_salt() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Ok(v) = std::env::var(PII_SALT_ENV_VAR) {
+        if !v.is_empty() {
             eprintln!(
-                "[WARN] {PII_SALT_ENV_VAR} not set -- using an insecure default salt \
-                 (local/dev only, do not use this path in production)."
+                "[WARN] using {PII_SALT_ENV_VAR} env override for the PII salt -- \
+                 local/offline use only; production fetches from Key Vault."
             );
-            DEV_FALLBACK_SALT.to_string()
+            return Ok(v);
         }
     }
+    let vault_url =
+        std::env::var(KEY_VAULT_URL_ENV_VAR).unwrap_or_else(|_| DEFAULT_KEY_VAULT_URL.to_string());
+    let credential = azure_credential()?;
+    let client = azure_security_keyvault_secrets::SecretClient::new(&vault_url, credential, None)?;
+    let secret = client
+        .get_secret(PII_SALT_SECRET_NAME, None)
+        .await?
+        .into_model()?;
+    let value = secret
+        .value
+        .ok_or_else(|| format!("Key Vault secret {PII_SALT_SECRET_NAME} has no value"))?;
+    println!("[INITIALIZATION] PII salt loaded from Key Vault ({vault_url})");
+    Ok(value)
 }
 
 /// SHA-256, salted. The POC blueprint's illustrative snippet hashed
@@ -148,14 +184,131 @@ pub fn mask_ip(ip_address: &str) -> String {
     }
 }
 
+/// Real trailing-window velocity (Chunk 10, closing the stub open since
+/// Chunk 2): per-account count of events whose *arrival* time falls inside
+/// the trailing 60 seconds, maintained as an in-process sliding window.
+///
+/// Documented tradeoffs (an in-process cache was chosen deliberately over a
+/// shared state store like Redis, which isn't budget-justified here):
+///   - state RESETS ON RESTART (first events after a restart under-count);
+///   - state is PER-REPLICA -- if KEDA scales the app past one replica,
+///     each replica sees only its own share of an account's traffic;
+///   - the window is over INGESTION ARRIVAL time (RawTransaction carries no
+///     event timestamp), so batch replays of historical data measure replay
+///     rate, not historical rate -- correct semantics for a live stream,
+///     which is what the deployed service exists for.
+pub struct VelocityTracker {
+    windows: std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<u64>>>,
+}
+
+const VELOCITY_WINDOW_SECS: u64 = 60;
+
+impl VelocityTracker {
+    pub fn new() -> Self {
+        Self {
+            windows: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Records an event for `account` at `now_secs` and returns the count of
+    /// that account's events in the trailing window (including this one).
+    pub fn record_and_count(&self, account: &str, now_secs: u64) -> u32 {
+        let mut windows = self.windows.lock().expect("velocity lock poisoned");
+        let dq = windows.entry(account.to_string()).or_default();
+        dq.push_back(now_secs);
+        let cutoff = now_secs.saturating_sub(VELOCITY_WINDOW_SECS);
+        while dq.front().is_some_and(|&t| t < cutoff) {
+            dq.pop_front();
+        }
+        dq.len() as u32
+    }
+}
+
+impl Default for VelocityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Dead-letter destination for events whose sink dispatch exhausted every
+/// retry (Chunk 10): each failure is appended as one JSON line carrying the
+/// enriched payload, the sink error, and a timestamp -- failures are never
+/// silently dropped. A file, not a separate Event Hub / Service Bus queue:
+/// a second messaging resource isn't budget-justified for this build (noted
+/// as a deliberate scope decision in context.md). In the container, the
+/// file lives on ephemeral storage -- adequate for inspection/alerting via
+/// stderr+Log Analytics, not durable across replica restarts; that caveat
+/// travels with the decision.
+pub struct DeadLetter {
+    file: Mutex<tokio::fs::File>,
+    path: String,
+}
+
+impl DeadLetter {
+    pub async fn new(path: &str) -> std::io::Result<Self> {
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        Ok(Self {
+            file: Mutex::new(file),
+            path: path.to_string(),
+        })
+    }
+
+    pub async fn write(&self, payload: &str, error: &str) {
+        let record = serde_json::json!({
+            "dead_lettered_at": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "error": error,
+            "payload": payload,
+        });
+        let mut file = self.file.lock().await;
+        let line = format!("{record}\n");
+        // write_all + flush: tokio's File buffers internally, and write_all
+        // returning does NOT mean the bytes reached the OS -- found
+        // empirically (intermittent empty reads immediately after a
+        // completed write). A dead-letter record that can evaporate in a
+        // buffer defeats the point, so every record is flushed through.
+        let result = async {
+            file.write_all(line.as_bytes()).await?;
+            file.flush().await
+        }
+        .await;
+        if let Err(e) = result {
+            // Last-resort visibility: the dead-letter itself failed. stderr
+            // is captured by Log Analytics in the deployed container.
+            eprintln!(
+                "[DEAD-LETTER FAILURE] could not persist to {}: {e}; payload={payload}",
+                self.path
+            );
+        }
+    }
+}
+
 pub struct IngestionEngine {
     sink: Arc<dyn Sink>,
     pii_salt: String,
+    velocity: Arc<VelocityTracker>,
+    dead_letter: Option<Arc<DeadLetter>>,
 }
 
 impl IngestionEngine {
     pub fn new(sink: Arc<dyn Sink>, pii_salt: String) -> Self {
-        Self { sink, pii_salt }
+        Self {
+            sink,
+            pii_salt,
+            velocity: Arc::new(VelocityTracker::new()),
+            dead_letter: None,
+        }
+    }
+
+    pub fn with_dead_letter(mut self, dead_letter: Arc<DeadLetter>) -> Self {
+        self.dead_letter = Some(dead_letter);
+        self
     }
 
     /// Parses, masks/hashes, and enriches one raw event, then hands the
@@ -174,6 +327,13 @@ impl IngestionEngine {
         let ip_masked = mask_ip(&tx.ip_address);
         let ingestion_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
+        // Real trailing-60s per-account velocity (see VelocityTracker for
+        // the in-process-state tradeoffs) -- counted for the initiating
+        // (source) account, including this event.
+        let velocity_score_1m = self
+            .velocity
+            .record_and_count(&tx.source_account, ingestion_timestamp);
+
         let enriched = EnrichedTransaction {
             transaction_id: tx.transaction_id,
             source_account: tx.source_account,
@@ -183,18 +343,19 @@ impl IngestionEngine {
             device_hash,
             ip_masked,
             ingestion_timestamp,
-            // Real-time velocity scoring needs a shared cache (e.g. Redis)
-            // fed by prior events for the same account -- out of scope for
-            // the ingestion engine itself; wired in when that cache exists.
-            velocity_score_1m: 0,
+            velocity_score_1m,
         };
 
         let payload = serde_json::to_string(&enriched)?;
         let sink = Arc::clone(&self.sink);
+        let dead_letter = self.dead_letter.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = sink.send(&payload).await {
                 eprintln!("[INGESTION ERROR] Failed to forward to sink: {e}");
+                if let Some(dl) = dead_letter {
+                    dl.write(&payload, &e.to_string()).await;
+                }
             }
         });
 
@@ -231,6 +392,58 @@ mod tests {
         let a = hash_device_id("MAC-A1B2C3", "salt-1");
         let b = hash_device_id("MAC-DIFFERENT", "salt-1");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn velocity_counts_within_window() {
+        let v = VelocityTracker::new();
+        assert_eq!(v.record_and_count("ACC-1", 1000), 1);
+        assert_eq!(v.record_and_count("ACC-1", 1010), 2);
+        assert_eq!(v.record_and_count("ACC-1", 1059), 3);
+        // Different account: independent window.
+        assert_eq!(v.record_and_count("ACC-2", 1059), 1);
+    }
+
+    #[test]
+    fn velocity_expires_events_older_than_60s() {
+        let v = VelocityTracker::new();
+        assert_eq!(v.record_and_count("ACC-1", 1000), 1);
+        assert_eq!(v.record_and_count("ACC-1", 1030), 2);
+        // Window at t=1085 is [1025, 1085]: 1000 expired, 1030 retained.
+        assert_eq!(v.record_and_count("ACC-1", 1085), 2);
+        // Window at t=1101 is [1041, 1101]: 1000 and 1030 both expired,
+        // only 1085 and this event remain.
+        assert_eq!(v.record_and_count("ACC-1", 1101), 2);
+        // Far future: everything prior expired.
+        assert_eq!(v.record_and_count("ACC-1", 9999), 1);
+    }
+
+    #[tokio::test]
+    async fn dead_letter_captures_failed_sends() {
+        struct AlwaysFailSink;
+        #[async_trait]
+        impl Sink for AlwaysFailSink {
+            async fn send(&self, _payload: &str) -> Result<(), SinkError> {
+                Err(SinkError("synthetic outage".into()))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let dl_path = dir.path().join("dl.jsonl");
+        let dl = Arc::new(DeadLetter::new(dl_path.to_str().unwrap()).await.unwrap());
+        let engine =
+            IngestionEngine::new(Arc::new(AlwaysFailSink), "salt".into()).with_dead_letter(dl);
+
+        let raw = br#"{"transaction_id":"TX-DL-1","source_account":"ACC-1","target_account":"ACC-2","amount":10.0,"asset_type":"USD","device_id":"DEV-1","ip_address":"10.0.0.1"}"#;
+        let handle = engine.process_stream_event(raw).await.unwrap();
+        handle.await.unwrap();
+
+        let contents = std::fs::read_to_string(&dl_path).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(record["error"], "sink error: synthetic outage");
+        assert!(record["payload"].as_str().unwrap().contains("TX-DL-1"));
+        assert!(record["dead_lettered_at"].as_u64().unwrap() > 0);
     }
 
     #[test]

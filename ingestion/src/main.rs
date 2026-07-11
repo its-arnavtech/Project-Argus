@@ -1,12 +1,23 @@
 //! Thin binary entrypoint: wires up a `Sink` from env vars, reads
-//! newline-delimited `RawTransaction` JSON from `data/simulated/` (Chunk 1's
-//! export, see data/scripts/export_ingestion_jsonl.py), and runs it through
+//! newline-delimited `RawTransaction` JSON, and runs it through
 //! `IngestionEngine`. `ARGUS_SINK=eventhub` (Chunk 4) sends to the real
 //! Event Hubs namespace via Azure AD auth -- set `ARGUS_EVENT_LIMIT` when
 //! using it against the full real corpus so a 1-TU dev namespace doesn't
 //! get blasted with all ~590K rows at once.
+//!
+//! Chunk 10 additions:
+//!   - PII salt comes from Key Vault (fetch_pii_salt), not an env var.
+//!   - Exhausted-retry sends are dead-lettered (ARGUS_DEAD_LETTER_PATH,
+//!     default dead_letter.jsonl).
+//!   - ARGUS_MODE=service keeps the process alive after draining input (or
+//!     with no input file at all) instead of exiting -- Container Apps
+//!     treats a fast-exiting container as a crash loop. The deployed
+//!     service's steady state is idle-until-fed; the demo's transaction
+//!     source is batch replay, not a live upstream feed.
 
-use ingestion::{pii_salt_from_env, EventHubSink, IngestionEngine, LocalFileSink, Sink, StdoutSink};
+use ingestion::{
+    fetch_pii_salt, DeadLetter, EventHubSink, IngestionEngine, LocalFileSink, Sink, StdoutSink,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -16,8 +27,9 @@ const DEFAULT_INPUT_JSONL: &str = concat!(
 );
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let salt = pii_salt_from_env();
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let service_mode = std::env::var("ARGUS_MODE").as_deref() == Ok("service");
+    let salt = fetch_pii_salt().await?;
 
     let sink: Arc<dyn Sink> = match std::env::var("ARGUS_SINK").as_deref() {
         Ok("file") => {
@@ -27,9 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(LocalFileSink::new(&path).await?)
         }
         Ok("eventhub") => {
-            let namespace_hostname = std::env::var("ARGUS_EVENTHUB_NAMESPACE").unwrap_or_else(|_| {
-                "evhns-argus-dev-to614f.servicebus.windows.net".to_string()
-            });
+            let namespace_hostname = std::env::var("ARGUS_EVENTHUB_NAMESPACE")
+                .unwrap_or_else(|_| "evhns-argus-dev-to614f.servicebus.windows.net".to_string());
             let eventhub_name =
                 std::env::var("ARGUS_EVENTHUB_NAME").unwrap_or_else(|_| "transactions".to_string());
             println!("[INITIALIZATION] Sink: EventHubSink -> {namespace_hostname}/{eventhub_name}");
@@ -41,46 +52,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let engine = Arc::new(IngestionEngine::new(sink, salt));
+    let dead_letter_path =
+        std::env::var("ARGUS_DEAD_LETTER_PATH").unwrap_or_else(|_| "dead_letter.jsonl".to_string());
+    let dead_letter = Arc::new(DeadLetter::new(&dead_letter_path).await?);
+    println!("[INITIALIZATION] Dead-letter path: {dead_letter_path}");
+
+    let engine = Arc::new(IngestionEngine::new(sink, salt).with_dead_letter(dead_letter));
 
     let input_path =
         std::env::var("ARGUS_INPUT_JSONL").unwrap_or_else(|_| DEFAULT_INPUT_JSONL.to_string());
-    println!("[INITIALIZATION] Launching Argus ingestion engine, reading from {input_path}");
 
-    let file = tokio::fs::File::open(&input_path).await.map_err(|e| {
-        format!(
-            "failed to open {input_path}: {e} (run data/scripts/export_ingestion_jsonl.py first)"
-        )
-    })?;
-    let mut lines = BufReader::new(file).lines();
+    let file = match tokio::fs::File::open(&input_path).await {
+        Ok(f) => Some(f),
+        Err(e) if service_mode => {
+            println!(
+                "[INITIALIZATION] no input file at {input_path} ({e}) -- service mode, idling."
+            );
+            None
+        }
+        Err(e) => {
+            return Err(format!(
+                "failed to open {input_path}: {e} (run data/scripts/export_ingestion_jsonl.py first)"
+            )
+            .into());
+        }
+    };
 
-    let limit: Option<usize> = std::env::var("ARGUS_EVENT_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok());
-    if let Some(limit) = limit {
-        println!("[INITIALIZATION] Capping this run at {limit} events (ARGUS_EVENT_LIMIT).");
+    if let Some(file) = file {
+        println!("[INITIALIZATION] Launching Argus ingestion engine, reading from {input_path}");
+        let mut lines = BufReader::new(file).lines();
+
+        let limit: Option<usize> = std::env::var("ARGUS_EVENT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        if let Some(limit) = limit {
+            println!("[INITIALIZATION] Capping this run at {limit} events (ARGUS_EVENT_LIMIT).");
+        }
+
+        let mut handles = Vec::new();
+        let mut count = 0usize;
+        while let Some(line) = lines.next_line().await? {
+            if limit.is_some_and(|limit| count >= limit) {
+                break;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            match engine.process_stream_event(line.as_bytes()).await {
+                Ok(handle) => handles.push(handle),
+                Err(e) => eprintln!("[INGESTION ERROR] {e}"),
+            }
+            count += 1;
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        println!("[DRAIN COMPLETE] Ingested {count} events.");
     }
 
-    let mut handles = Vec::new();
-    let mut count = 0usize;
-    while let Some(line) = lines.next_line().await? {
-        if limit.is_some_and(|limit| count >= limit) {
-            break;
+    if service_mode {
+        println!("[SERVICE] input drained; staying alive (scale-to-zero handles shutdown).");
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+            println!("[SERVICE] heartbeat: alive and idle.");
         }
-        if line.trim().is_empty() {
-            continue;
-        }
-        match engine.process_stream_event(line.as_bytes()).await {
-            Ok(handle) => handles.push(handle),
-            Err(e) => eprintln!("[INGESTION ERROR] {e}"),
-        }
-        count += 1;
     }
 
-    for handle in handles {
-        let _ = handle.await;
-    }
-
-    println!("[DRAIN COMPLETE] Ingested {count} events.");
     Ok(())
 }

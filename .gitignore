@@ -29,6 +29,10 @@ dashboards/extracts/
 mlruns/
 mlflow.db
 
+# Ingestion runtime output
+dead_letter.jsonl
+ingested_output.jsonl
+
 # Secrets
 .env
 .env.*

@@ -14,16 +14,18 @@ use azure_messaging_eventhubs::{
     ConsumerClient, OpenReceiverOptions, ProducerClient, StartLocation, StartPosition,
 };
 use futures::stream::StreamExt;
-use ingestion::{pii_salt_from_env, EventHubSink, IngestionEngine};
+use ingestion::{fetch_pii_salt, EventHubSink, IngestionEngine};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-const DEFAULT_INPUT_JSONL: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../data/simulated/funds_transfer_raw.jsonl");
+const DEFAULT_INPUT_JSONL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../data/simulated/funds_transfer_raw.jsonl"
+);
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let namespace_hostname = std::env::var("ARGUS_EVENTHUB_NAMESPACE")
         .unwrap_or_else(|_| "evhns-argus-dev-to614f.servicebus.windows.net".to_string());
     let eventhub_name =
@@ -47,7 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let properties = marker_producer.get_eventhub_properties().await?;
     let mut start_sequence: HashMap<String, i64> = HashMap::new();
     for partition_id in &properties.partition_ids {
-        let p = marker_producer.get_partition_properties(partition_id).await?;
+        let p = marker_producer
+            .get_partition_properties(partition_id)
+            .await?;
         start_sequence.insert(partition_id.clone(), p.last_enqueued_sequence_number);
     }
     println!(
@@ -57,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     marker_producer.close().await?;
 
     // Send `limit` real events through the full ingestion engine + EventHubSink.
-    let salt = pii_salt_from_env();
+    let salt = fetch_pii_salt().await?;
     let sink = Arc::new(EventHubSink::new(&namespace_hostname, &eventhub_name).await?);
     let engine = Arc::new(IngestionEngine::new(sink, salt));
 

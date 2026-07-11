@@ -10,10 +10,9 @@
 //! expectations (`DeveloperToolsCredential` replacing the
 //! `DefaultAzureCredential` name older SDK generations used).
 
-use crate::{Sink, SinkError};
+use crate::{azure_credential, Sink, SinkError};
 use async_trait::async_trait;
 use azure_core::time::Duration as AzureDuration;
-use azure_identity::DeveloperToolsCredential;
 use azure_messaging_eventhubs::{ProducerClient, RetryOptions, SendEventOptions};
 use std::time::Duration as StdDuration;
 
@@ -32,15 +31,15 @@ pub struct EventHubSink {
 
 impl EventHubSink {
     /// Opens a producer connection to `eventhub_name` in `namespace_hostname`
-    /// (e.g. "evhns-argus-dev-to614f.servicebus.windows.net") using
-    /// `DeveloperToolsCredential`, which tries `AzureCliCredential` first --
-    /// this is what makes the Chunk 4 dev-only RBAC grant ("Azure Event Hubs
-    /// Data Sender" on the current az CLI identity) actually work locally.
-    /// Chunk 10 swaps this for the Container App's managed identity in
-    /// production; no code change needed here, since both are
-    /// `TokenCredential` implementations behind the same `Arc<dyn ...>`.
+    /// (e.g. "evhns-argus-dev-to614f.servicebus.windows.net") using the
+    /// shared credential chain from `lib.rs` (Chunk 10): the Container App's
+    /// system-assigned managed identity when running in Azure (its "Azure
+    /// Event Hubs Data Sender" grant), the developer-tools/az-CLI chain
+    /// locally (the Chunk 4 dev-only grant). Both are `TokenCredential`
+    /// implementations, so nothing else in this sink changes between
+    /// environments.
     pub async fn new(namespace_hostname: &str, eventhub_name: &str) -> Result<Self, SinkError> {
-        let credential = DeveloperToolsCredential::new(None)
+        let credential = azure_credential()
             .map_err(|e| SinkError(format!("failed to build Azure AD credential: {e}")))?;
 
         let producer = ProducerClient::builder()
@@ -67,7 +66,10 @@ impl Sink for EventHubSink {
         loop {
             let result = self
                 .producer
-                .send_event(payload.to_string(), Some(SendEventOptions { partition_id: None }))
+                .send_event(
+                    payload.to_string(),
+                    Some(SendEventOptions { partition_id: None }),
+                )
                 .await;
 
             match result {
