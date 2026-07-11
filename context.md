@@ -626,12 +626,16 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   is unused, anticipatory, and flagged rather than silently
   over-provisioned. Revisit if/when the ingestion engine ever writes to
   the graph directly.
-- The GHCR package `argus-ingestion` is now PUBLIC (anonymous pull, to
-  let Container Apps fetch it without a stored registry credential) --
-  the repo itself stays private. The image contains only the compiled
-  release binary and no secrets/source, so this was judged an acceptable
-  tradeoff, but it is a real, deliberate visibility change worth knowing
-  is there.
+- SUPERSEDING IN PROGRESS: the GHCR package `argus-ingestion` is
+  currently PUBLIC (anonymous pull, so Container Apps could fetch it
+  without a stored registry credential). Reconsidered in the Chunk 10
+  addendum session as inconsistent with this project's no-public-
+  exposure pattern -- an ACR migration (managed-identity pull, no public
+  image) is planned and its Terraform plan is saved
+  (tfplan_chunk10_addendum) but NOT YET APPLIED, awaiting go-ahead. Once
+  applied and confirmed working, the GHCR package should be flipped back
+  to private/deleted -- this bullet should be removed at that point, not
+  left stale.
 - The CI workflow (build-ingestion-image.yml) builds and pushes the
   image but does NOT run `cargo test`/`cargo clippy` first -- those were
   run manually this session (11/11 passing, clean) but aren't yet a CI
@@ -918,5 +922,64 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   as a settled, permanent constraint rather than an open TODO. Two
   Known-Issue items closed this chunk (velocity stub, untracked Gremlin
   grant); no new stubs left silently in place.
+- 2026-07-11 — Claude Code — Chunk 10 ADDENDUM (three items raised after
+  the chunk was first marked complete):
+  (1) REGISTRY RECONSIDERED. User asked point-blank whether making the
+  GHCR package public was something explicitly approved or something
+  decided and reported after the fact. Honest answer: explicitly
+  approved -- the AskUserQuestion option the user selected stated
+  plainly "makes the image (compiled binary only) publicly pullable."
+  Gap acknowledged: no tool call in that session actually changed the
+  package's visibility, so it's not certain whether the user performed
+  the flip or GHCR defaulted it that way for a personal-account package
+  -- that ambiguity should have been surfaced at the time and wasn't.
+  Decision: switch to Azure Container Registry regardless, since a
+  publicly pullable image is inconsistent with this project's
+  no-static-secret, no-public-exposure pattern everywhere else, budget
+  headroom easily covers it, and MI-based pull removes the ambiguity
+  entirely. Verified live pricing via the Azure Retail Prices API (not
+  assumed): ACR Basic = $0.1666/day base unit (~$5.00/30-day month) +
+  $0.10/GB-month over the free 10GiB (our image is 141MB, well within
+  it) -- ~$5/month against ~$74 headroom. Verified in the azurerm
+  provider SOURCE (website doc is ambiguous here) that
+  `registry.identity = "System"` is valid for the container app's own
+  system-assigned identity, same pattern already proven for the KEDA
+  scale rule's `identity_id`. Terraform written
+  (infra/envs/dev/container_registry.tf: azurerm_container_registry
+  Basic, admin_enabled=false, AcrPull role assignment to the app's MI;
+  infra/envs/dev/ingestion_app.tf updated with a `registry` block and
+  image path pointing at the new ACR). Plan shown, saved as
+  tfplan_chunk10_addendum: 2 to add, 1 to change, 0 to destroy --
+  AWAITING GO-AHEAD, not yet applied. Once applied, the plan is: `az acr
+  import` the current image straight from the (still public) GHCR
+  package -- no Docker Desktop needed for this one-time copy -- then
+  flip the GHCR package back to private (or delete it) once the ACR
+  pull path is confirmed working, closing the public-exposure gap for
+  real rather than just adding an alternative next to it.
+  (2) CI TEST GATE. .github/workflows/build-ingestion-image.yml split
+  into a `test` job (cargo test --release + cargo clippy --release
+  --all-targets -- -D warnings) that the `build-and-push` job now
+  `needs:` -- a red test run blocks the push. Verified the exact clippy
+  invocation passes locally first (0 warnings) so the new gate doesn't
+  immediately redline CI.
+  (3) LOAD-TEST CONTAMINATION. Checked empirically (partition
+  properties via the azure-eventhub SDK) rather than assumed: the
+  ~6,400 events flagged as leftover from Chunks 4/7's validation runs
+  have ALREADY aged out via the 1-day retention -- both partitions'
+  beginning_sequence_number has advanced past them. That specific
+  concern is moot. Found instead a smaller NEW residual: 600 events
+  from this session's own KEDA-verification burst (sent ~14:02 UTC),
+  which will itself fully age out by ~2026-07-12 14:02 UTC. Decision for
+  Chunk 11: don't gate the load test on waiting for natural expiry.
+  Instead (a) for throughput/latency numbers, capture each partition's
+  starting sequence number immediately before the test run and measure
+  only events at/after that marker -- the same technique
+  examples/eventhub_validate.rs already uses, which is immune to any
+  pre-existing backlog regardless of its source; (b) for any KEDA
+  scale-timing SLO specifically (sensitive to TOTAL retained count, not
+  just new arrivals, per the Chunk 10 finding that this scaler has no
+  checkpointing consumer), first verify all partitions report
+  `is_empty=true` -- or explicitly net out the pre-existing count --
+  before measuring "time to scale from empty."
 
 Last updated: 2026-07-11 by Claude Code

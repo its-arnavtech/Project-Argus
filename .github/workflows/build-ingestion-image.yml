@@ -18,7 +18,26 @@ permissions:
   packages: write
 
 jobs:
+  # Chunk 10 addendum: a red test run must never reach an image that gets
+  # deployed. This job gates the build-and-push job below via `needs` --
+  # cargo test / clippy failing here means the push never happens.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ingestion
+      - run: cargo test --release
+        working-directory: ingestion
+      - run: cargo clippy --release --all-targets -- -D warnings
+        working-directory: ingestion
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

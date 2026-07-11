@@ -32,12 +32,6 @@ resource "azurerm_storage_container" "keda_checkpoints" {
 }
 
 # --- The ingestion Container App --------------------------------------------
-variable "ingestion_image" {
-  type        = string
-  description = "Fully-qualified container image for the ingestion service."
-  default     = "ghcr.io/its-arnavtech/argus-ingestion:chunk10"
-}
-
 resource "azurerm_container_app" "ingestion" {
   name                         = "argus-ingestion"
   container_app_environment_id = module.container_apps.environment_id
@@ -48,13 +42,21 @@ resource "azurerm_container_app" "ingestion" {
     type = "SystemAssigned"
   }
 
+  # Chunk 10 addendum: pulled from ACR via the app's own system identity
+  # (AcrPull, granted in container_registry.tf) -- no admin credentials,
+  # no public image.
+  registry {
+    server   = azurerm_container_registry.this.login_server
+    identity = "System"
+  }
+
   template {
     min_replicas = 0
     max_replicas = 1
 
     container {
       name   = "ingestion"
-      image  = var.ingestion_image
+      image  = "${azurerm_container_registry.this.login_server}/argus-ingestion:chunk10"
       cpu    = 0.25
       memory = "0.5Gi"
 
