@@ -1470,4 +1470,24 @@ money at tiers does not fix them -- code/architecture changes would.
   Gremlin RBAC grant which IS now Terraform-tracked). STEP 4: this entry;
   open work now lives on the Issues tab, not appended here.
 
-Last updated: 2026-07-12 by Claude Code (v1.0 + security-clean, issues on GitHub)
+- 2026-07-12 — Claude Code — issue-resolution pass + CI. Added a real
+  PR-gated CI workflow (.github/workflows/ci.yml: Rust fmt/clippy/test +
+  Python pytest) -- the fmt gate surfaced pre-existing formatting drift in
+  event_hub_sink.rs/main.rs (the old image-build CI only ran test+clippy),
+  fixed via cargo fmt. Fixed the code-fixable GitHub issues on branch
+  fix/resolve-open-issues, opened PR #13, CI went green (rust + python),
+  squash-merged to main (image-build CI on main also green): #5 SHARING_CAP
+  now env-overridable, #6 hop-distance dual-definition documented, #7
+  inference writes synchronous on Windows (dodges the ProactorEventLoop
+  crash) / async on Linux, #12 loader token refresh keyed on actual
+  expires_on (+ 5 unit tests). Remaining issues handled honestly, NOT
+  fake-closed: #9 (LLM quota) and #10 (TLS 1.2) closed as "not planned"
+  (permanent platform facts); #1 (KEDA, needs infra), #2 (ingestion latency,
+  architectural), #3 (inference latency, needs GPU), #4 (device-hash skew,
+  needs retrain), #8 (Tableau, needs the tool), #11 (velocity, needs Redis)
+  left OPEN with per-issue disposition comments -- none are solvable with
+  Azure torn down / no GPU / no Tableau, and pretending otherwise would
+  violate the honesty rule this project runs on. Python unit suite now 31
+  tests.
+
+Last updated: 2026-07-12 by Claude Code (v1.0 + security-clean + CI green; open work on GitHub Issues)
