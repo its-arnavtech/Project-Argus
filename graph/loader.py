@@ -103,25 +103,48 @@ def make_client(token: str, pool_size: int = 4) -> gclient.Client:
 
 
 class ClientHolder:
-    """Shared client with token refresh: an Entra token lives ~60-90 min and
-    the full-corpus load can run that long -- on an auth failure, ONE thread
-    rebuilds the client with a fresh token while the rest retry through it.
-    (Chunk 5's single-shot subset load never needed this.)"""
+    """Shared client with PROACTIVE token refresh. An Entra token lives
+    ~60-90 min; the full-corpus edge load runs ~90 min (the single logical
+    partition caps at 10,000 RU/s => ~350 edges/sec regardless of worker
+    count), so it WILL outlive one token. The first attempt relied on
+    reactive refresh keyed on "401"/"Unauthorized" in the error string --
+    but Cosmos closes the websocket on expiry, which surfaces as a
+    connection/transport error, not a clean 401, so the match missed and
+    every post-expiry insert failed into the failure list. Fix: rebuild
+    the client on a time budget (`maybe_refresh`), called only between
+    fully-drained chunks so no in-flight op is ever using a client being
+    closed. Reactive detection is kept as a broadened backstop."""
 
-    def __init__(self, pool_size: int):
+    def __init__(self, pool_size: int, max_age_sec: float = 1800.0):
         self.pool_size = pool_size
+        self.max_age_sec = max_age_sec
         self.lock = threading.Lock()
         self.client = make_client(get_cosmos_token(), pool_size)
+        self.created_at = time.time()
+
+    def _rebuild(self) -> None:
+        old = self.client
+        self.client = make_client(get_cosmos_token(), self.pool_size)
+        self.created_at = time.time()
+        try:
+            old.close()
+        except Exception:  # noqa: BLE001 -- best-effort
+            pass
+
+    def maybe_refresh(self) -> None:
+        """Proactive: rebuild if the token is older than the budget. Safe to
+        call ONLY when no futures are in flight (between drained chunks)."""
+        if time.time() - self.created_at >= self.max_age_sec:
+            print("[LOADER] proactive token refresh (client age exceeded budget)", flush=True)
+            self._rebuild()
 
     def refresh(self, dead_client) -> None:
+        """Reactive backstop: a thread hit an auth/connection error mid-chunk.
+        Only the first thread to notice this particular dead client rebuilds."""
         with self.lock:
-            if self.client is dead_client:  # only the first thread rebuilds
-                print("[LOADER] refreshing Entra token / Gremlin client...")
-                try:
-                    dead_client.close()
-                except Exception:  # noqa: BLE001 -- already broken, close is best-effort
-                    pass
-                self.client = make_client(get_cosmos_token(), self.pool_size)
+            if self.client is dead_client:
+                print("[LOADER] reactive client rebuild after transport/auth error", flush=True)
+                self._rebuild()
 
 
 def submit(c: gclient.Client, query: str, bindings: dict | None = None):
@@ -142,19 +165,29 @@ def submit(c: gclient.Client, query: str, bindings: dict | None = None):
     raise RuntimeError(f"query still throttled after {MAX_RETRIES} retries: {query[:120]}")
 
 
+_AUTH_OR_TRANSPORT_MARKERS = (
+    "401", "unauthorized", "authorization", "authentication",
+    "connection", "closed", "transport", "websocket", "eof", "broken pipe",
+)
+
+
 def submit_via_holder(holder: ClientHolder, query: str, bindings: dict | None = None):
-    """submit() plus auth-expiry recovery, for the long-running full load."""
-    for _ in range(3):
+    """submit() plus auth/transport recovery, for the long-running full load.
+    Detection is broadened well beyond '401' because token expiry manifests
+    as a closed websocket / transport error, not a clean auth code (the
+    lesson from the first full-load attempt)."""
+    for _ in range(4):
         c = holder.client
         try:
             return submit(c, query, bindings)
-        except Exception as e:  # noqa: BLE001 -- classify, re-raise if not auth
-            msg = str(e)
-            if "401" in msg or "Unauthorized" in msg or "authorization" in msg.lower():
+        except Exception as e:  # noqa: BLE001 -- classify, re-raise if not recoverable
+            msg = str(e).lower()
+            if any(marker in msg for marker in _AUTH_OR_TRANSPORT_MARKERS):
                 holder.refresh(c)
+                time.sleep(0.5)
                 continue
             raise
-    raise RuntimeError("auth retry exhausted for query: " + query[:120])
+    raise RuntimeError("auth/transport retry exhausted for query: " + query[:120])
 
 
 def clean_props(row: dict) -> dict:
@@ -265,21 +298,40 @@ def select_full():
     }
 
 
-def load_concurrent(holder: ClientHolder, tables: dict) -> dict:
-    """Same insert queries as load(), executed by LOADER_CONCURRENCY worker
-    threads against the holder's pooled client. Per-element failures are
-    collected, not silently swallowed; a nonzero failure count is reported
-    loudly at the end."""
+# Rows are processed in fully-drained chunks: every future in a chunk
+# resolves before the next chunk starts, which gives a safe point to
+# proactively refresh the token (no op is ever mid-flight on a client being
+# closed). ~20k rows/chunk at ~350/sec is ~1 min -- fine-grained progress
+# and refresh checks without per-row lock overhead.
+LOAD_CHUNK_ROWS = int(os.environ.get("ARGUS_LOAD_CHUNK_ROWS", "20000"))
+
+
+def _run_group(pool, holder, label, insert_fn, rows, failures) -> int:
+    """Load one vertex/edge group in drained chunks; returns success count."""
+    n_ok = 0
+    t0 = time.time()
+    for start in range(0, len(rows), LOAD_CHUNK_ROWS):
+        holder.maybe_refresh()  # safe: previous chunk fully drained
+        chunk = rows[start : start + LOAD_CHUNK_ROWS]
+        futs = [pool.submit(insert_fn, row) for row in chunk]
+        for f in futs:
+            try:
+                f.result()
+                n_ok += 1
+            except Exception as e:  # noqa: BLE001 -- collected, surfaced loudly at end
+                failures.append(f"{label}: {e}")
+        rate = n_ok / max(time.time() - t0, 1e-9)
+        print(f"[LOADER]   {label}: {n_ok}/{len(rows)} ok ({rate:.0f}/s)", flush=True)
+    print(f"[LOADER] {label}: {n_ok}/{len(rows)} in {time.time()-t0:.0f}s", flush=True)
+    return n_ok
+
+
+def load_concurrent(holder: ClientHolder, tables: dict, edges_only: bool = False) -> dict:
+    """Chunked concurrent load with drain-safe proactive token refresh.
+    `edges_only` skips vertices (used when a prior run already landed all
+    142,395 vertices and only edges need (re)loading)."""
     counts = {"vertices": {}, "edges": {}}
     failures: list[str] = []
-    done = {"n": 0}
-    progress_lock = threading.Lock()
-
-    def tick(total_in_group: int, label: str):
-        with progress_lock:
-            done["n"] += 1
-            if done["n"] % 5000 == 0:
-                print(f"[LOADER]   {label}: {done['n']}/{total_in_group} group-total", flush=True)
 
     def insert_vertex(label, id_col, row):
         props = clean_props(row)
@@ -303,40 +355,34 @@ def load_concurrent(holder: ClientHolder, tables: dict) -> dict:
         submit_via_holder(holder, query, bindings)
 
     with ThreadPoolExecutor(max_workers=LOADER_CONCURRENCY) as pool:
-        # Vertices strictly before edges: addE requires both endpoints.
-        for label, (df, id_col) in tables["vertices"].items():
-            done["n"] = 0
-            t0 = time.time()
-            futs = [pool.submit(insert_vertex, label, id_col, row) for row in df.to_dict("records")]
-            n_ok = 0
-            for f in futs:
-                try:
-                    f.result()
-                    n_ok += 1
-                    tick(len(df), label)
-                except Exception as e:  # noqa: BLE001
-                    failures.append(f"{label}: {e}")
-            counts["vertices"][label] = n_ok
-            print(f"[LOADER] vertices {label}: {n_ok}/{len(df)} in {time.time()-t0:.0f}s", flush=True)
+        if not edges_only:
+            for label, (df, id_col) in tables["vertices"].items():
+                rows = df.to_dict("records")
+                counts["vertices"][label] = _run_group(
+                    pool, holder, f"V:{label}", lambda r, la=label, ic=id_col: insert_vertex(la, ic, r), rows, failures
+                )
         for label, (df, src_col, dst_col) in tables["edges"].items():
-            done["n"] = 0
-            t0 = time.time()
-            futs = [pool.submit(insert_edge, label, src_col, dst_col, row) for row in df.to_dict("records")]
-            n_ok = 0
-            for f in futs:
-                try:
-                    f.result()
-                    n_ok += 1
-                    tick(len(df), label)
-                except Exception as e:  # noqa: BLE001
-                    failures.append(f"{label}: {e}")
-            counts["edges"][label] = n_ok
-            print(f"[LOADER] edges {label}: {n_ok}/{len(df)} in {time.time()-t0:.0f}s", flush=True)
+            rows = df.to_dict("records")
+            counts["edges"][label] = _run_group(
+                pool, holder, f"E:{label}",
+                lambda r, la=label, sc=src_col, dc=dst_col: insert_edge(la, sc, dc, r), rows, failures
+            )
 
     if failures:
-        print(f"[LOADER] !!! {len(failures)} element failures; first 5: {failures[:5]}")
+        print(f"[LOADER] !!! {len(failures)} element failures; first 5: {failures[:5]}", flush=True)
     counts["failures"] = len(failures)
     return counts
+
+
+def drop_all_edges(holder: ClientHolder) -> None:
+    """Batched edge drop -- used before an edges-only reload so the 42k
+    FUNDS_TRANSFER edges from the failed first attempt don't duplicate."""
+    while True:
+        remaining = submit_via_holder(holder, "g.E().count()")[0]
+        if remaining == 0:
+            return
+        print(f"[LOADER] dropping existing edges... {remaining} remain", flush=True)
+        submit_via_holder(holder, "g.E().limit(1000).drop()")
 
 
 def add_ring_owns_edges(c: gclient.Client) -> int:
@@ -488,6 +534,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate", action="store_true", help="validation only, no load")
     parser.add_argument("--full", action="store_true", help="load the FULL corpus (concurrent; needs the RU bump)")
+    parser.add_argument("--edges-only", action="store_true", help="drop+reload edges only (vertices already present)")
     parser.add_argument(
         "--add-ring-owns",
         action="store_true",
@@ -495,19 +542,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.full:
+    if args.full or args.edges_only:
         holder = ClientHolder(pool_size=LOADER_CONCURRENCY)
         try:
             tables = select_full()
             planned_v = sum(len(df) for df, _ in tables["vertices"].values())
             planned_e = sum(len(df) for df, _, _ in tables["edges"].values())
-            print(f"[LOADER] FULL load planned: {planned_v} vertices, {planned_e} edges, "
-                  f"{LOADER_CONCURRENCY} workers")
-            drop_existing(holder.client)
+            if args.edges_only:
+                print(f"[LOADER] EDGES-ONLY reload: {planned_e} edges, {LOADER_CONCURRENCY} workers "
+                      f"(assumes {planned_v} vertices already loaded)")
+                drop_all_edges(holder)
+            else:
+                print(f"[LOADER] FULL load planned: {planned_v} vertices, {planned_e} edges, "
+                      f"{LOADER_CONCURRENCY} workers")
+                drop_existing(holder.client)
             start = time.time()
-            counts = load_concurrent(holder, tables)
+            counts = load_concurrent(holder, tables, edges_only=args.edges_only)
             elapsed = time.time() - start
-            print(f"\n[LOADER] FULL load complete in {elapsed:.0f}s: {json.dumps(counts)}")
+            print(f"\n[LOADER] load complete in {elapsed:.0f}s: {json.dumps(counts)}")
             validate(holder.client)
         finally:
             holder.client.close()
