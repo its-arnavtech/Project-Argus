@@ -24,6 +24,16 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - Exact next action: run Chunk 12 prompt (docs polish & demo packaging —
   final README pass, architecture diagram/walkthrough, and whatever else
   the last chunk needs to make this presentable as a portfolio piece).
+- BEFORE the demo is coherent, Chunk 12 must resolve the DEMO-STATE
+  CONSISTENCY item at the top of Known Issues: live Cosmos now holds the
+  full 40,289-account graph but only partially scored and with no SAR
+  drafts (the 2026-07-12 enterprise benchmark dropped the old scored+SAR
+  subset). Decide: finish full-graph scoring offline + re-run the
+  orchestrator, or reload the subset.
+- A post-Chunk-11 session (2026-07-12) fixed ingestion + inference latency
+  as far as architecture allows and benchmarked dev vs enterprise tier;
+  see the Architectural Decisions entry + comparison table. Both latency
+  SLOs remain unmet for architectural (not resource) reasons.
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -587,6 +597,43 @@ Azure subscription: "Azure subscription 1" (subscription ID redacted -- see loca
 Connection strings, keys, the subscription ID, the alert email, and the random suffix's source are in Terraform state / terraform.tfvars (both gitignored) -- never in this file. (2026-07-11 security pass: subscription ID and alert email were previously written out in full here and in terraform.tfvars/variables.tf; redacted and purged from git history -- see Architectural Decisions Log.)
 
 ## Known Issues / TODO
+- DEMO-STATE CONSISTENCY (created 2026-07-12, needs a decision in Chunk 12):
+  the enterprise benchmark DROPPED the old 5.4K-vertex subset (which had
+  gnn_risk_score + Chunk 8 SAR drafts on its accounts) and loaded the FULL
+  40,289-account graph. Cosmos is now back at 1,000 RU/s (dev baseline) but
+  holds the FULL graph, only PARTIALLY scored (the ~48 inference batches
+  drained before I stopped the run to save meter cost scored a subset of
+  accounts), and with NO SAR drafts (the drop wiped them; the orchestrator
+  wasn't re-run). So Chunk 9's Tableau extract and Chunk 8's SARs are now
+  stale against live Cosmos. Chunk 12 must either (a) finish full-graph
+  inference offline at dev tier (free but slow at 1,000 RU/s) + re-run the
+  orchestrator to restore a coherent scored+SAR state, or (b) reload the
+  original subset. Flagged prominently, not silently left broken.
+- 2026-07-12: 885 of 590,582 ACCESSED_FROM edges (0.15% of that edge type,
+  0.046% of all edges) failed during the full load at one instant when
+  DefaultAzureCredential returned a cached token expiring that exact second
+  (04:42:05). Negligible for graph-scale GNN message passing; not retried
+  (the failure list holds error strings, not row identities, so a clean
+  retry would need an idempotent reload). If it ever matters: reload
+  ACCESSED_FROM with dedup. Deeper fix for the loader would be to refresh
+  when the token is within N minutes of its actual expiry rather than on a
+  fixed age budget.
+- RESOLVED 2026-07-12 (ingestion latency, was FAILING): EventHubSink now
+  pipelines batches (bounded 8-way). Real throughput exceeds target at
+  every tier (dev 15,151 @ 12TU / enterprise 21,037 events/sec), but
+  ingestion LATENCY still FAILS <45ms in every honest framing (clean batch
+  RTT ~305ms; paced arrival-to-ingested 813ms @ 5,000/sec) -- the batch
+  pipeline depth is inherent. Not a mystery, just not achievable at <45ms
+  with this batching design; a per-partition-key ordered fast path would be
+  the next lever if the SLO is hard.
+- IMPROVED but still FAILING 2026-07-12 (inference latency <300ms): Chunk
+  11's 21.96s per-batch -> 2.21s (enterprise, full graph) after fixing the
+  real costs (the cached-edge-tensor and concurrent-write fixes; the
+  "full-graph forward" was never the main cost -- it's 0.68s). Still fails
+  because that 0.68s CPU forward alone exceeds 300ms and there's no GPU
+  here. Subgraph scoping was rejected with data (graph too dense to help).
+  Real remaining levers: GPU inference, or a genuinely incremental/
+  approximate scorer -- both are a dedicated chunk's work.
 - RESOLVED 2026-07-09: `data/raw/` now holds the real IEEE-CIS dataset
   (590,540 transactions) — Kaggle competition rules were accepted and
   `data/scripts/acquire_ieee_cis.py`/`ring_injector.py`/`eda_report.py`
@@ -1234,5 +1281,104 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   pass as literally measured; the two misses are both real, both
   understood (root cause known, not a mystery), and both have a
   concrete -- if not-yet-implemented -- path down.
+- 2026-07-12 — Claude Code — INTER-CHUNK SESSION (between Chunk 11 and 12;
+  not a renumber). Goal reversed from every prior chunk: meaningfully USE
+  the ~$100 grant, not minimize spend. Fix the two failing SLOs, then
+  benchmark against a bounded enterprise-tier config.
+  BUDGET: raised the Terraform budget alert 75 -> 100 (in-place, percent
+  thresholds recompute to $50/$75/$90).
+  STEP 1 (ingestion latency): EventHubSink dispatched batches
+  sequentially -> pipelined with bounded concurrency (8 in flight via a
+  Semaphore; bound justified in-code, backpressures rather than the
+  unbounded spawn that OOM'd in Chunk 11). Tradeoff stated honestly:
+  cross-batch ordering no longer guaranteed (nothing downstream depends
+  on it). Before/after (real, measured): unpaced batch round-trip mean
+  ~170ms (Chunk 11, sequential) -> the concurrency raises AGGREGATE
+  throughput but individual batch RTT rose to ~305-310ms under 8-way
+  contention -- BOTH still FAIL <45ms. The honest arrival-rate figure
+  needs pacing (added ARGUS_PACE_EVENTS_PER_SEC): at 5,000/sec sustained,
+  LATENCY-FULL mean 813ms -- still FAIL, dominated by the 8-deep batch
+  pipeline. Ingestion latency does not clear <45ms at any tier.
+  STEP 2 (inference latency): the headline finding is that Chunk 7/11's
+  "full-graph forward is the cost" premise was a MISMEASUREMENT. Profiled
+  it: the pure forward is 1.04s; the real 11.4s/batch cost was tensors()
+  re-sorting a 2.68M-entry Python set EVERY batch. The "architecturally
+  correct" 2-hop subgraph fix was investigated and REJECTED WITH DATA:
+  this graph's density (avg degree ~67) means even 2 seed nodes pull
+  23,664 nodes / 2.04M edges (59% of the graph) plus 160-680ms extraction
+  -- it costs more than the full pass, at every batch size. Real fixes
+  instead: cached incremental edge tensor (11.4s -> 26-47ms) and
+  concurrent Cosmos writes via gremlinpython pool_size+submit_async
+  (13-17s -> 0.6-2.2s). Per-batch latency (what one event's score truly
+  waits on): 21.96s (Chunk 11) -> 3.64s (dev small run) -> 2.21s
+  (enterprise full-graph, mean; p95 3.55s). Still FAILS <300ms -- the
+  full-graph CPU forward (0.68s) alone exceeds it, and there is no GPU on
+  this machine (torch.cuda.is_available()=False). A larger Container Apps
+  SKU is moot: the inference service isn't containerized (the standing
+  KEDA/consumer known issue). ~10x faster, honestly still short.
+  STEP 3-4 (enterprise benchmark): rejected a wholesale tier="enterprise"
+  flip with verified reasons -- it renames the EH namespace
+  (destroy/create) and flips cosmos_free_tier=false which REPLACES the
+  Cosmos account (destroying graph + Gremlin RBAC + the once-per-sub free
+  tier). Instead: a PARALLEL Premium namespace (4 PU, 32 partitions,
+  PDD-literal) behind a single toggle whose teardown DELETES it, plus an
+  in-place Cosmos RU bump 1,000 -> 10,000 (the single-logical-partition
+  ceiling; higher is provably wasted). All pricing verified live via the
+  Retail Prices API. Standard->Premium confirmed NOT an in-place upgrade
+  (needs a new resource); Premium partitions can increase, never
+  decrease. Full graph loaded: 142,395 vertices + 1,930,094/1,930,979
+  edges (99.95%; 885 ACCESSED_FROM edges lost to a token-boundary race,
+  see Known Issues) via a rewritten concurrent loader (32 workers,
+  drain-safe proactive token refresh, ~500 edges/sec = the 10K-RU/s
+  single-partition ceiling, ~66 min). Enterprise ingestion throughput:
+  21,037 events/sec (vs dev's 1-TU ~1,000/sec cap and Chunk 11's
+  15,151/sec @ 12 TU). Enterprise inference: per-batch mean 2.21s over
+  the full 40,289-node graph, now writing scores for EVERY affected
+  account (all 40K present in Cosmos vs 1,853 in the old subset). Model
+  eval unchanged by tier (the model doesn't depend on infra): full-graph
+  precision 1.000, recall 0.9016, FP-rate 0.000.
+  KEDA producer/consumer fix: assessed, NOT done this session (it needs
+  containerizing the Python inference service + a new Container App + a
+  checkpoint store -- a dedicated chunk's work). Remains the one standing
+  known issue.
+  STEP 5-6 (teardown): Premium namespace + hub + 2 RBAC role assignments
+  DESTROYED (verified: ResourceNotFound), Cosmos reverted to 1,000 RU/s
+  (verified live). No parallel resource left running.
+  COST (honest, incl. an overrun vs my own plan): the Premium+RU window
+  ran ~7.05 hours (03:30->10:33 UTC), NOT the "a few hours" planned,
+  because Premium sat provisioned during the broken first load AND the
+  long background-load / async-notification gaps. Runtime-based estimate:
+  Premium 4PU $4.108/hr x 7.05h = ~$28.98 + Cosmos +9,000 RU $0.72/hr x
+  7.05h = ~$5.08 = ~$34.06 incremental. (The Cost Management API showed
+  only +$1.05 at teardown time -- it lags 8-24h and had not yet posted
+  the Premium hours.) Well within the $100 budget (~$65 headroom left),
+  but ~$4-9 over my plan estimate. Root causes, owned: (1) the first
+  full-load attempt failed after ~40 min when the Entra token expired and
+  reactive refresh missed it (Cosmos closes the socket on expiry = a
+  transport error, not a clean 401) -- ~$5 of idle/broken Premium time;
+  (2) I should have torn Premium down during the 66-min pure-Cosmos edge
+  reload and recreated it for the inference test (~$4.50 saved), but
+  chose to avoid apply churn -- in hindsight the wrong call given the
+  idle billing.
+
+### Dev-tier vs Enterprise-tier SLO comparison (2026-07-12 session)
+
+Config: DEV = Standard EH 1 TU / 2 partitions, Cosmos free 1,000 RU/s,
+5.4K-vertex subset. ENTERPRISE = Premium EH 4 PU / 32 partitions, Cosmos
+10,000 RU/s, full 40,289-account graph. All numbers real/measured; caveat
+that some dev numbers predate the concurrency fixes (labeled).
+
+| SLO (PDD target) | Dev-tier | Enterprise-tier | Pass? |
+|---|---|---|---|
+| Ingestion throughput (>10,000 evt/s) | ~1,000/s (1-TU cap) / 15,151/s @ 12 TU burst (Chunk 11) | **21,037 evt/s** | Enterprise PASS; dev PASS only when TU-bumped |
+| Ingestion latency (<45ms) | batch RTT ~170ms (Chunk 11, pre-fix) | batch RTT ~305ms; paced arrival 813ms | **FAIL both** |
+| GNN inference latency (<300ms) | 3.64s/batch (post-fix small run) | **2.21s/batch** full graph (was 21.96s in Chunk 11) | **FAIL both** (forward 0.68s alone >300ms) |
+| False-positive rate (<2.5%) | 0.000% (held-out + subset) | **0.000%** (full 40,289-node graph) | **PASS both** |
+
+Bottom line: enterprise scale decisively wins throughput and cuts
+inference latency ~10x, but the two latency SLOs are unmet at ANY tier
+for architectural reasons (batch-pipeline depth for ingestion; CPU
+full-graph forward for inference), not resource starvation. Throwing more
+money at tiers does not fix them -- code/architecture changes would.
 
 Last updated: 2026-07-12 by Claude Code
