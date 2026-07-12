@@ -109,6 +109,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("[INITIALIZATION] Capping this run at {limit} events (ARGUS_EVENT_LIMIT).");
         }
 
+        // Post-Chunk-11: optional pacing. An unpaced replay saturates the
+        // client queue by construction, so per-event LATENCY-FULL there
+        // measures backlog drain (~corpus/throughput/2), not what an event
+        // experiences at a sustainable arrival rate -- which is what the
+        // PDD's <45ms ingestion-latency SLO is actually about. Pacing
+        // releases events at a fixed rate below capacity so LATENCY-FULL
+        // becomes a true arrival-to-ingested figure.
+        let pace: Option<f64> = std::env::var("ARGUS_PACE_EVENTS_PER_SEC")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        if let Some(p) = pace {
+            println!("[INITIALIZATION] Pacing input at {p} events/sec (ARGUS_PACE_EVENTS_PER_SEC).");
+        }
+        let pace_start = std::time::Instant::now();
+
         let mut handles = Vec::new();
         let mut count = 0usize;
         while let Some(line) = lines.next_line().await? {
@@ -117,6 +132,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             if line.trim().is_empty() {
                 continue;
+            }
+            if let Some(p) = pace {
+                let due = pace_start + std::time::Duration::from_secs_f64(count as f64 / p);
+                let now = std::time::Instant::now();
+                if due > now {
+                    tokio::time::sleep(due - now).await;
+                }
             }
             match engine.process_stream_event(line.as_bytes()).await {
                 Ok(handle) => handles.push(handle),

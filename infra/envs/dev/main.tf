@@ -71,7 +71,7 @@ module "cosmos_db" {
   location            = azurerm_resource_group.this.location
 
   free_tier_enabled = local.cfg.cosmos_free_tier
-  throughput        = local.cfg.cosmos_throughput
+  throughput        = coalesce(var.benchmark_cosmos_throughput, local.cfg.cosmos_throughput)
 
   tags = local.common_tags
 }

@@ -10,13 +10,16 @@ Usage:
     python eventhub_marker.py count marker.json   # events at/after marker, per partition
 """
 import json
+import os
 import sys
 
 from azure.eventhub import EventHubConsumerClient
 from azure.identity import AzureCliCredential
 
-NAMESPACE = "evhns-argus-dev-to614f.servicebus.windows.net"
-EVENTHUB = "transactions"
+NAMESPACE = os.environ.get(
+    "ARGUS_EVENTHUB_NAMESPACE", "evhns-argus-dev-to614f.servicebus.windows.net"
+)
+EVENTHUB = os.environ.get("ARGUS_EVENTHUB_NAME", "transactions")
 
 
 def _client():

@@ -35,6 +35,9 @@ Microsoft Learn docs AND empirically tested against the live account,
 
 Usage:
     python graph/loader.py                 # load subset (drops existing data first)
+    python graph/loader.py --full          # load the FULL corpus (~2.07M elements;
+                                            # post-Chunk-11 benchmark -- needs the
+                                            # Cosmos RU bump, concurrent workers)
     python graph/loader.py --validate      # run traversal validation only, no load
     python graph/loader.py --add-ring-owns # add only the ring accounts' OWNS
                                             # edges (both endpoints already
@@ -44,7 +47,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +59,14 @@ from azure.identity import DefaultAzureCredential
 from gremlin_python.driver import client as gclient
 from gremlin_python.driver import serializer
 from gremlin_python.driver.protocol import GremlinServerError
+
+# Post-Chunk-11: the original loader is strictly sequential (~17 elements/sec
+# observed in Chunk 5), which would take DAYS for the 2.07M-element full
+# corpus. Bounded worker threads each run the same retrying submit() against
+# a shared client whose connection pool matches the worker count. 32 workers
+# ~= the concurrency needed to saturate the single logical partition's
+# 10,000 RU/s ceiling at ~10-15 RU and ~30-70ms per insert.
+LOADER_CONCURRENCY = int(os.environ.get("ARGUS_LOADER_CONCURRENCY", "32"))
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SIM_DIR = REPO_ROOT / "data" / "simulated"
@@ -76,14 +90,38 @@ def get_cosmos_token() -> str:
     return DefaultAzureCredential().get_token("https://cosmos.azure.com/.default").token
 
 
-def make_client(token: str) -> gclient.Client:
+def make_client(token: str, pool_size: int = 4) -> gclient.Client:
     return gclient.Client(
         url=GREMLIN_URL,
         traversal_source="g",
         username=f"/dbs/{DATABASE}/colls/{GRAPH}",
         password=token,
         message_serializer=serializer.GraphSONSerializersV2d0(),
+        pool_size=pool_size,
+        max_workers=pool_size,
     )
+
+
+class ClientHolder:
+    """Shared client with token refresh: an Entra token lives ~60-90 min and
+    the full-corpus load can run that long -- on an auth failure, ONE thread
+    rebuilds the client with a fresh token while the rest retry through it.
+    (Chunk 5's single-shot subset load never needed this.)"""
+
+    def __init__(self, pool_size: int):
+        self.pool_size = pool_size
+        self.lock = threading.Lock()
+        self.client = make_client(get_cosmos_token(), pool_size)
+
+    def refresh(self, dead_client) -> None:
+        with self.lock:
+            if self.client is dead_client:  # only the first thread rebuilds
+                print("[LOADER] refreshing Entra token / Gremlin client...")
+                try:
+                    dead_client.close()
+                except Exception:  # noqa: BLE001 -- already broken, close is best-effort
+                    pass
+                self.client = make_client(get_cosmos_token(), self.pool_size)
 
 
 def submit(c: gclient.Client, query: str, bindings: dict | None = None):
@@ -102,6 +140,21 @@ def submit(c: gclient.Client, query: str, bindings: dict | None = None):
                 continue
             raise
     raise RuntimeError(f"query still throttled after {MAX_RETRIES} retries: {query[:120]}")
+
+
+def submit_via_holder(holder: ClientHolder, query: str, bindings: dict | None = None):
+    """submit() plus auth-expiry recovery, for the long-running full load."""
+    for _ in range(3):
+        c = holder.client
+        try:
+            return submit(c, query, bindings)
+        except Exception as e:  # noqa: BLE001 -- classify, re-raise if not auth
+            msg = str(e)
+            if "401" in msg or "Unauthorized" in msg or "authorization" in msg.lower():
+                holder.refresh(c)
+                continue
+            raise
+    raise RuntimeError("auth retry exhausted for query: " + query[:120])
 
 
 def clean_props(row: dict) -> dict:
@@ -187,6 +240,103 @@ def select_subset(rng: np.random.Generator):
             "OWNS": (sel_owns, "src_cust_id", "dst_acct_id"),
         },
     }
+
+
+def select_full():
+    """The ENTIRE corpus -- every vertex and edge table, no sampling, no
+    caps. 142,395 vertices + 1,930,979 edges = 2,073,374 elements (counted
+    from the parquet files, 2026-07-12). Only viable with the benchmark
+    Cosmos RU bump + concurrent workers."""
+    return {
+        "vertices": {
+            "Account": (pd.read_parquet(SIM_DIR / "vertices_account.parquet"), "acct_id"),
+            "Customer": (pd.read_parquet(SIM_DIR / "vertices_customer.parquet"), "cust_id"),
+            "Device": (pd.read_parquet(SIM_DIR / "vertices_device.parquet"), "device_hash"),
+            "IPAddress": (pd.read_parquet(SIM_DIR / "vertices_ipaddress.parquet"), "ip_string"),
+            "Merchant": (pd.read_parquet(SIM_DIR / "vertices_merchant.parquet"), "merch_id"),
+        },
+        "edges": {
+            "FUNDS_TRANSFER": (pd.read_parquet(SIM_DIR / "edges_funds_transfer.parquet"), "src_acct_id", "dst_acct_id"),
+            "ACCESSED_FROM": (pd.read_parquet(SIM_DIR / "edges_accessed_from.parquet"), "src_acct_id", "dst_ip_string"),
+            "USED_DEVICE": (pd.read_parquet(SIM_DIR / "edges_used_device.parquet"), "src_acct_id", "dst_device_hash"),
+            "SETTLED_AT": (pd.read_parquet(SIM_DIR / "edges_settled_at.parquet"), "src_acct_id", "dst_merch_id"),
+            "OWNS": (pd.read_parquet(SIM_DIR / "edges_owns.parquet"), "src_cust_id", "dst_acct_id"),
+        },
+    }
+
+
+def load_concurrent(holder: ClientHolder, tables: dict) -> dict:
+    """Same insert queries as load(), executed by LOADER_CONCURRENCY worker
+    threads against the holder's pooled client. Per-element failures are
+    collected, not silently swallowed; a nonzero failure count is reported
+    loudly at the end."""
+    counts = {"vertices": {}, "edges": {}}
+    failures: list[str] = []
+    done = {"n": 0}
+    progress_lock = threading.Lock()
+
+    def tick(total_in_group: int, label: str):
+        with progress_lock:
+            done["n"] += 1
+            if done["n"] % 5000 == 0:
+                print(f"[LOADER]   {label}: {done['n']}/{total_in_group} group-total", flush=True)
+
+    def insert_vertex(label, id_col, row):
+        props = clean_props(row)
+        vid = str(props.pop(id_col))
+        query = f"g.addV('{label}').property('id', vid).property('{id_col}', vid).property('partitionKey', pk)"
+        bindings = {"vid": vid, "pk": PARTITION_KEY_VALUE}
+        for i, (k, v) in enumerate(props.items()):
+            query += f".property('{k}', p{i})"
+            bindings[f"p{i}"] = v
+        submit_via_holder(holder, query, bindings)
+
+    def insert_edge(label, src_col, dst_col, row):
+        props = clean_props(row)
+        src = str(props.pop(src_col))
+        dst = str(props.pop(dst_col))
+        query = "g.V(srcId).has('partitionKey', pk).addE(elabel).to(g.V(dstId).has('partitionKey', pk))"
+        bindings = {"srcId": src, "dstId": dst, "pk": PARTITION_KEY_VALUE, "elabel": label}
+        for i, (k, v) in enumerate(props.items()):
+            query += f".property('{k}', p{i})"
+            bindings[f"p{i}"] = v
+        submit_via_holder(holder, query, bindings)
+
+    with ThreadPoolExecutor(max_workers=LOADER_CONCURRENCY) as pool:
+        # Vertices strictly before edges: addE requires both endpoints.
+        for label, (df, id_col) in tables["vertices"].items():
+            done["n"] = 0
+            t0 = time.time()
+            futs = [pool.submit(insert_vertex, label, id_col, row) for row in df.to_dict("records")]
+            n_ok = 0
+            for f in futs:
+                try:
+                    f.result()
+                    n_ok += 1
+                    tick(len(df), label)
+                except Exception as e:  # noqa: BLE001
+                    failures.append(f"{label}: {e}")
+            counts["vertices"][label] = n_ok
+            print(f"[LOADER] vertices {label}: {n_ok}/{len(df)} in {time.time()-t0:.0f}s", flush=True)
+        for label, (df, src_col, dst_col) in tables["edges"].items():
+            done["n"] = 0
+            t0 = time.time()
+            futs = [pool.submit(insert_edge, label, src_col, dst_col, row) for row in df.to_dict("records")]
+            n_ok = 0
+            for f in futs:
+                try:
+                    f.result()
+                    n_ok += 1
+                    tick(len(df), label)
+                except Exception as e:  # noqa: BLE001
+                    failures.append(f"{label}: {e}")
+            counts["edges"][label] = n_ok
+            print(f"[LOADER] edges {label}: {n_ok}/{len(df)} in {time.time()-t0:.0f}s", flush=True)
+
+    if failures:
+        print(f"[LOADER] !!! {len(failures)} element failures; first 5: {failures[:5]}")
+    counts["failures"] = len(failures)
+    return counts
 
 
 def add_ring_owns_edges(c: gclient.Client) -> int:
@@ -337,12 +487,31 @@ def validate(c: gclient.Client) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate", action="store_true", help="validation only, no load")
+    parser.add_argument("--full", action="store_true", help="load the FULL corpus (concurrent; needs the RU bump)")
     parser.add_argument(
         "--add-ring-owns",
         action="store_true",
         help="add only the ring accounts' OWNS edges (targeted fix, no drop/reload)",
     )
     args = parser.parse_args()
+
+    if args.full:
+        holder = ClientHolder(pool_size=LOADER_CONCURRENCY)
+        try:
+            tables = select_full()
+            planned_v = sum(len(df) for df, _ in tables["vertices"].values())
+            planned_e = sum(len(df) for df, _, _ in tables["edges"].values())
+            print(f"[LOADER] FULL load planned: {planned_v} vertices, {planned_e} edges, "
+                  f"{LOADER_CONCURRENCY} workers")
+            drop_existing(holder.client)
+            start = time.time()
+            counts = load_concurrent(holder, tables)
+            elapsed = time.time() - start
+            print(f"\n[LOADER] FULL load complete in {elapsed:.0f}s: {json.dumps(counts)}")
+            validate(holder.client)
+        finally:
+            holder.client.close()
+        return
 
     token = get_cosmos_token()
     c = make_client(token)
