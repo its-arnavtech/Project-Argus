@@ -102,14 +102,22 @@ docs/
   specs/                   # master specs (POC blueprint, PDD guide)
 data/            scripts/ (acquisition + ring injection); raw/ & simulated/ gitignored
 ingestion/       Rust engine: src/{lib,main,event_hub_sink}.rs, Dockerfile, 11 tests
-ml/              training/ (GNN + full-scale eval), inference/ (real-time service), artifacts/
+ml/              training/ (GNN + full-scale eval), inference/ (real-time service + batch scorer), artifacts/
 agents/          LangGraph compliance loop + orchestrator
 graph/           Cosmos Gremlin loader (subset + --full)
 infra/           Terraform: modules/ + envs/dev (tier-switchable)
 dashboards/      Tableau workbook + extract exporter
-tests/           load/ (marker isolation); unit/ integration/ scaffolded
+tests/           unit/ (26 pytest cases), load/ (marker isolation); integration/ scaffolded
 .github/workflows/  CI: test-gated image build/push
 ```
+
+**Testing scope, honestly:** the Rust engine has 11 unit/integration tests
+(PII masking, velocity window, dead-letter, throughput). The Python side has
+26 pytest unit tests covering the *pure, network-free* logic — hashing,
+row sanitisation, deterministic fallbacks, ring-injection invariants. The
+cloud-touching paths (Gremlin loads, Event Hubs, inference against live
+Cosmos) are exercised by the validation scripts and the load-test harness, not
+by mocked unit tests — so "26 tests" is real but targeted, not full coverage.
 
 ## Status
 

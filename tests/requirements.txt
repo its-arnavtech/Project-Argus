@@ -1,0 +1,4 @@
+# Test dependencies. Run with the repo venv (numpy/pandas/torch already there):
+#   .venv/Scripts/python.exe -m pip install -r tests/requirements.txt
+#   .venv/Scripts/python.exe -m pytest tests/unit -q
+pytest>=8,<10

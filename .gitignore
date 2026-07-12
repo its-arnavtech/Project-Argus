@@ -46,3 +46,6 @@ ingested_output.jsonl
 .DS_Store
 .vscode/
 .idea/
+
+# pytest
+.pytest_cache/

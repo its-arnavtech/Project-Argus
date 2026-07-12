@@ -608,6 +608,18 @@ Azure subscription: "Azure subscription 1" (subscription ID redacted -- see loca
 Connection strings, keys, the subscription ID, the alert email, and the random suffix's source are in Terraform state / terraform.tfvars (both gitignored) -- never in this file. (2026-07-11 security pass: subscription ID and alert email were previously written out in full here and in terraform.tfvars/variables.tf; redacted and purged from git history -- see Architectural Decisions Log.)
 
 ## Known Issues / TODO
+
+> 2026-07-12 (post-v1.0 security session): the genuinely-OPEN items are now
+> tracked as GitHub Issues (#1–#12) on the repo's Issues tab, not in this
+> file — the KEDA producer/consumer scaling bug (#1), the two unmet latency
+> SLOs (#2, #3), device-hash train/serve skew (#4), the untuned sharing-cap
+> (#5), the hop-distance naming clash (#6), the Windows async-Gremlin write
+> crash (#7), the unvalidated Tableau workbook (#8), the gpt-5-mini quota
+> constraint (#9), the TLS-1.2 ceiling (#10), in-process velocity state (#11),
+> and the loader token-refresh race (#12). The historical/RESOLVED entries
+> below stay for the record; new open work should be filed as issues, not
+> appended here.
+
 - RESOLVED-ENOUGH 2026-07-12 (Chunk 12) then MOOT (teardown): the enterprise
   benchmark dropped the old scored+SAR subset and loaded the full
   40,289-account graph, leaving it only partially scored with no SAR drafts.
@@ -791,12 +803,12 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
 - `docs/` — `ENGINEERING_JOURNEY.md` (Chunk 12: curated assumptions-corrected / bugs-found / spec-conflicts-resolved record — the headline deliverable); `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` holds chunk1_data_eda_summary.md, partition_key_strategy.md, observability_queries.md (KQL + TLS posture), architecture_diagram.md (Chunk 12: as-built Mermaid), final_resource_inventory.md (Chunk 12: last live `az resource list` + spend summary), example_sar_draft.md (Chunk 12: real regenerated SAR artifact)
 - `data/` — `scripts/` holds `graph_schema.py` (shared vertex/edge schema + real-data derivation), `acquire_ieee_cis.py` (Kaggle acquisition + bundled-sample fallback), `ring_injector.py` (synthetic ring injection), `eda_report.py` (validation/EDA); `raw/` and `simulated/` are gitignored but currently populated (bundled sample + 45 injected rings) — regenerate anytime via the three scripts in order
 - `ingestion/` — real Cargo crate (11 passing tests): `src/lib.rs` (structs, `Sink` trait, SHA-256 PII masking, `azure_credential()` MI/dev chain, `fetch_pii_salt()` Key Vault fetch, `VelocityTracker` real trailing-60s window, `DeadLetter` flushed JSONL, `LatencyRecorder` real per-event/per-batch timing added Chunk 11), `src/event_hub_sink.rs` (Entra auth, Chunk 11: internal batching via create_batch/try_add_event_data/send_batch -- real throughput fix, ~15 evt/s -> 14,675-15,151 evt/s -- `Sink` trait interface unchanged), `src/main.rs` (`ARGUS_MODE=service` for the deployed container; `ARGUS_SINK=eventhub`, `ARGUS_EVENT_LIMIT`, `ARGUS_MEASURE_LATENCY`), `examples/eventhub_validate.rs`, `Dockerfile` + `.dockerignore` (multi-stage, 141MB, non-root)
-- `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction), `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export), and `eval_full_scale.py` (Chunk 11: reuses train_gnn.py's exact eval_split/ring_component_split to evaluate against ALL known ring labels, not just the held-out test split -- directly comparable numbers); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- inference loads these); `inference/` holds `inference_service.py` (Event Hubs consumer -> incremental state -> GNN scoring -> Cosmos write-back, `--validate` for post-run checks, `ARGUS_INFERENCE_BATCH_SIZE` added Chunk 11) + `prepare_validation_events.py`. NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
+- `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction), `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export), and `eval_full_scale.py` (Chunk 11: reuses train_gnn.py's exact eval_split/ring_component_split to evaluate against ALL known ring labels, not just the held-out test split -- directly comparable numbers); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- inference loads these); `inference/` holds `inference_service.py` (Event Hubs consumer -> incremental state -> GNN scoring -> Cosmos write-back, `--validate` for post-run checks, `ARGUS_INFERENCE_BATCH_SIZE` added Chunk 11), `batch_score_accounts.py` (post-v1.0: formalized direct one-shot scorer -- full-graph forward + synchronous Cosmos writes, `--ring-members`/`--all`/`--min-score`; the reusable version of the inline scorer written live during the Chunk 12 SAR-regen), and `prepare_validation_events.py`. NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
 - `agents/` — `compliance_graph.py` (real LangGraph StateGraph: NetworkTracer w/ live Gremlin traversals, BehavioralAnalyst w/ real transaction metrics, SARGenerator w/ real Foundry LLM call, groundedness guardrail w/ conditional retry edge), `orchestrator.py` (Cosmos cross-query discovery of flagged accounts -> pipeline -> SAR stored on vertex), `requirements.txt`. Runs on global Python (no torch needed)
 - `graph/` — `loader.py` (Cosmos Gremlin subset loader + traversal validation; `--validate` for checks only, `--add-ring-owns` for the targeted OWNS-edge fix; auth via `DefaultAzureCredential` + Gremlin RBAC, no account key) + `requirements.txt` (gremlinpython, azure-identity)
 - `infra/` — real Terraform: `modules/{event_hubs,cosmos_db,container_apps,key_vault,budget_alert}` (5 modules; `cosmos_db` now includes the actual Gremlin graph container, not just account/database), `envs/dev` (wires them together, tier-switchable "dev"/"enterprise"); provisioned and live in Azure (see Environment & Resource Reference)
 - `dashboards/` — `export_tableau_extract.py` (Gremlin + transaction queries flattened to `extracts/argus_tableau_extract.csv|parquet`, gitignored; rerun = refresh), `argus_fraud_dashboard.twb` (hand-authored workbook, three PDD section 3 calculated fields, needs visual check in Tableau Desktop)
-- `tests/` — `unit/`, `integration/` scaffolded, empty; `load/eventhub_marker.py` (Chunk 11: marker-based test isolation -- capture per-partition sequence numbers before a run, count only events after)
+- `tests/` — `conftest.py` (sys.path setup for the non-package component dirs), `unit/` (post-v1.0: 26 genuine pytest cases -- PII SHA-256 hashing, loader.clean_props sanitisation, deterministic ingestion device/IP fallbacks, ring-injection row invariants; pure/network-free logic only, honestly not full coverage), `requirements.txt` (pytest); `load/eventhub_marker.py` (Chunk 11: marker-based test isolation); `integration/` scaffolded
 - `.github/workflows/` — `build-ingestion-image.yml` (CI image build+push to GHCR with the workflow's GITHUB_TOKEN; triggers on ingestion/** changes or manual dispatch)
 - Root — `README.md`, `LICENSE` (MIT), `.gitignore`, `context.md` (this file)
 
@@ -1426,4 +1438,36 @@ money at tiers does not fix them -- code/architecture changes would.
   section, committed, tagged v1.0. Audit Flags printed unedited in the final
   session summary.
 
-Last updated: 2026-07-12 by Claude Code (v1.0 — project complete)
+## Session Log (post-v1.0 security & hardening pass)
+- 2026-07-12 — Claude Code — post-v1.0 security audit + cleanup. STEP 1
+  SECURITY AUDIT (the priority): CLEAN. GitHub secret-scanning API 0 alerts;
+  gitleaks 8.30.1 over the FULL history (28 commits) found "no leaks"; no
+  .tfstate ever committed (verified two ways); targeted greps for EH
+  connection strings / SAS / storage keys / cloud tokens / private keys =
+  zero in tracked files and all history. The get_cosmos_key/ARGUS_COSMOS_KEY
+  "never committed" claim was verified independently (only doc/docstring
+  mentions saying it's NOT used -- no key value anywhere). One thing checked
+  carefully and cleared: terraform.tfvars WAS committed once (47b6ec6) and is
+  still reachable, but its content is post-history-rewrite REDACTED
+  placeholders (alert_email=r***@example.com, no subscription_id, no keys) --
+  the 2026-07-11 security pass really did rewrite history, so the real email
+  and sub-id (824c532c-...) appear in ZERO commits. Local
+  terraform.tfstate/.backup hold real secrets but are gitignored/untracked
+  (correct). gitleaks' 66 working-tree hits were all in .venv (third-party
+  test fixtures) or the local gitignored tfstate -- 0 in tracked files.
+  Conclusion: no key/token/credential in history or any tracked file; not the
+  stop-the-session trigger, proceeded. STEP 2: formalized the live-written
+  ring scorer into ml/inference/batch_score_accounts.py (documented,
+  --ring-members/--all/--min-score, synchronous writes to dodge the Windows
+  async-gremlin crash); confirmed the $75/$100 Architectural-Decisions-Log
+  distinction is already correct (historical entries show $75 at creation,
+  the 2026-07-12 raise to $100 is a later entry -- no change needed); added
+  tests/ (conftest + 26 pytest unit cases over pure logic), README testing
+  note kept honest ("real but targeted, not full coverage"). STEP 3: filed
+  GitHub Issues #1-#12 for the genuinely-open items, correctly labeled
+  (bug / tech-debt / known-limitation / documentation); did NOT file for
+  already-resolved items (CI gate, velocity stub, Gremlin auth, the azapi
+  Gremlin RBAC grant which IS now Terraform-tracked). STEP 4: this entry;
+  open work now lives on the Issues tab, not appended here.
+
+Last updated: 2026-07-12 by Claude Code (v1.0 + security-clean, issues on GitHub)
