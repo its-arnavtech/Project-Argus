@@ -17,23 +17,27 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 - [x] Chunk 9 — Tableau dashboard
 - [x] Chunk 10 — Production hardening
 - [x] Chunk 11 — Load testing & SLO validation
-- [ ] Chunk 12 — Docs polish & demo packaging  ← IN PROGRESS
+- [x] Chunk 12 — Docs polish & demo packaging (v1.0)
 
 ## Current State
-- Active chunk: 12
-- Exact next action: run Chunk 12 prompt (docs polish & demo packaging —
-  final README pass, architecture diagram/walkthrough, and whatever else
-  the last chunk needs to make this presentable as a portfolio piece).
-- BEFORE the demo is coherent, Chunk 12 must resolve the DEMO-STATE
-  CONSISTENCY item at the top of Known Issues: live Cosmos now holds the
-  full 40,289-account graph but only partially scored and with no SAR
-  drafts (the 2026-07-12 enterprise benchmark dropped the old scored+SAR
-  subset). Decide: finish full-graph scoring offline + re-run the
-  orchestrator, or reload the subset.
-- A post-Chunk-11 session (2026-07-12) fixed ingestion + inference latency
-  as far as architecture allows and benchmarked dev vs enterprise tier;
-  see the Architectural Decisions entry + comparison table. Both latency
-  SLOs remain unmet for architectural (not resource) reasons.
+- PROJECT COMPLETE — v1.0, all 12 chunks done (2026-07-12).
+- The live Azure deployment is TORN DOWN as of 2026-07-12 (the ~$100 credit
+  grant expired end of day). Final live snapshot:
+  docs/architecture/final_resource_inventory.md. Everything is redeployable
+  from infra/envs/dev via `terraform apply` with fresh credentials.
+- Primary deliverables this final chunk: docs/ENGINEERING_JOURNEY.md
+  (curated assumptions-corrected / bugs-found record), a rewritten README
+  with the real dev+enterprise SLO scorecard and a Known Limitations
+  section, docs/architecture/architecture_diagram.md (Mermaid, as-built),
+  and a real regenerated SAR artifact (docs/architecture/example_sar_draft.md).
+- Demo-state consistency (was a Known Issue): the 315 ring members were
+  re-scored live and a fresh 3/3-grounded SAR batch generated before the
+  grant expired, so the repo has a real current example. The full 40,289
+  graph in Cosmos was only partially GNN-scored at teardown — moot now that
+  the account is deprovisioned; a fresh redeploy would re-run inference.
+- If work ever resumes: the one genuinely-open engineering item is the KEDA
+  producer-vs-consumer scaling fix (containerize the inference consumer,
+  scale on its own checkpointed lag) — see Known Issues + ENGINEERING_JOURNEY.
 
 ## Architectural Decisions Log
 - 2026-07-09 — Scaled down PDD's enterprise Azure tiers (Premium Event Hubs,
@@ -580,11 +584,18 @@ Relational, rule-based transaction monitoring misses multi-hop structural fraud 
 
 ## Environment & Resource Reference
 
-Azure subscription: "Azure subscription 1" (subscription ID redacted -- see local terraform.tfvars / az account show), confirmed with the user 2026-07-09 as the ~$75 credit grant subscription. Region: East US 2 (eastus2) for all resources. Provisioned via infra/envs/dev (tier=dev):
+> STATUS 2026-07-12: the credit grant expired end of day and the live
+> deployment is TORN DOWN. This section describes the last-live dev-baseline
+> configuration for the record and for redeployment; resource names/IDs are
+> the ones that existed. A final `az resource list` snapshot is in
+> docs/architecture/final_resource_inventory.md. Redeploy via
+> `cd infra/envs/dev && terraform apply`.
+
+Azure subscription: "Azure subscription 1" (subscription ID redacted -- see local terraform.tfvars / az account show), confirmed with the user 2026-07-09 as the credit grant subscription (~$75 initially; the grant was ~$100 and the budget alert was raised to $100 in the 2026-07-12 session). Region: East US 2 (eastus2) for all resources. Provisioned via infra/envs/dev (tier=dev):
 
 - Resource group: `rg-argus-dev`
 - Event Hubs namespace: `evhns-argus-dev-to614f` (Standard, 1 TU baseline -- temporarily 12 during Chunk 11's load test, reverted -- event hub `transactions`, 2 partitions [immutable on Standard tier, confirmed via Microsoft's FAQ, never changed], 1-day retention). RBAC: current az CLI identity has "Azure Event Hubs Data Sender" + "Azure Event Hubs Data Receiver" on this namespace (dev-only bridge, Chunk 4 -- Chunk 10 replaces with the Container App's managed identity)
-- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s (still $0). LOADED: 5,387 vertices (1,853 Account / 1,853 Customer / 102 Device / 1,530 IPAddress / 49 Merchant) + 7,182 edges (1,380 FT / 1,580 AF / 831 UD / 1,538 SA / 1,853 OWNS, now 1:1 with every loaded account) -- the representative subset, not the full corpus. RBAC: "Cosmos DB Gremlin Built-in Data Contributor" on `argus-graph-container` for the current az CLI identity (role assignment id `fea56381-280f-4482-8619-1eb6e0933ed1`) -- **not Terraform-tracked** (azurerm has no native resource for this preview API yet; see Architectural Decisions Log). Both `graph/loader.py` and `ml/inference/inference_service.py` authenticate via this grant + `DefaultAzureCredential`, no account key.
+- Cosmos DB (Gremlin API) account: `cosmos-argus-dev-to614f` (free tier, single region, database `argus-graph` @ 1000 RU/s shared; endpoint `https://cosmos-argus-dev-to614f.documents.azure.com:443/`). Graph container: `argus-graph-container`, partition key `/partitionKey` (single shared low-cardinality key, value "argus" on every vertex -- see docs/architecture/partition_key_strategy.md), shares the database's 1000 RU/s baseline (temporarily 10,000 during the 2026-07-12 enterprise benchmark, reverted). LOADED history: Chunk 5 loaded a 5,387-vertex representative subset; the 2026-07-12 enterprise benchmark dropped that and loaded the FULL corpus (142,395 vertices / 1,930,094 edges, 99.95%), then re-scored the 315 ring members + generated a fresh SAR batch. (All moot post-teardown; a redeploy re-runs `graph/loader.py`.) RBAC: "Cosmos DB Gremlin Built-in Data Contributor" on `argus-graph-container` for the current az CLI identity (role assignment id `fea56381-280f-4482-8619-1eb6e0933ed1`) -- **now Terraform-tracked via the azapi provider** (imported into state in Chunk 10; azurerm still has no native resource for this preview API). Both `graph/loader.py` and `ml/inference/inference_service.py` authenticate via this grant + `DefaultAzureCredential`, no account key.
 - Key Vault: `kv-argus-dev-to614f` (RBAC authorization, soft-delete 7 days, purge protection off; `https://kv-argus-dev-to614f.vault.azure.net/`) -- holds `argus-pii-salt` (Chunk 10), the only secret this build genuinely needs stored (everything else is Entra-token auth).
 - Container Apps environment: `argus-dev-cae` (Consumption/scale-to-zero) + Log Analytics workspace `argus-dev-law`. DEPLOYED (Chunk 10, image source updated in the addendum): Container App `argus-ingestion` (image `acrargusdevto614f.azurecr.io/argus-ingestion:chunk10`, pulled via the app's own managed identity/AcrPull -- built+pushed to GHCR by CI, then `az acr import`'d into ACR; 0.25 vCPU/0.5Gi, min 0 / max 1 replicas baseline [temporarily 5 during Chunk 11's load test, reverted], KEDA azure-eventhub rule `eventhub-lag` @ 500-event threshold, MI-authenticated -- see Chunk 11's Architectural Decision for why this rule scales the wrong tier). System-assigned MI principal `19b38309-28e1-4e2c-8bf2-2092f9fd8bcd` with: EH Data Sender + Receiver (namespace), Key Vault Secrets User, Storage Blob Data Reader (checkpoints), AcrPull (registry), Gremlin Data Contributor (anticipatory, unused today). Console logs flow to `argus-dev-law` via the environment's log-analytics binding; saved KQL queries in docs/architecture/observability_queries.md
 - Container Registry: `acrargusdevto614f` (Basic SKU, ~$5/mo, admin_enabled=false -- RBAC/MI pull only). Sole current image: `argus-ingestion:chunk10`.
@@ -592,23 +603,23 @@ Azure subscription: "Azure subscription 1" (subscription ID redacted -- see loca
 - Key Vault secret `argus-pii-salt` -- the production PII salt (Chunk 10); fetched at startup by the ingestion service via MI, by local dev via az CLI identity
 - TWO-IDENTITY MODEL (Chunk 10): dev = az CLI identity (EH Sender/Receiver, Gremlin Data Contributor, Cognitive Services User, KV Secrets Officer) for local scripts/agents; prod = argus-ingestion's system MI (grants above). Both deliberate, neither replaces the other; all Gremlin grants now Terraform-tracked via azapi (untracked-grant gap closed by state import)
 - Foundry (AIServices) account: `argus-dev-foundry-to614f` (S0, $0 fixed cost) + project `argus-dev-proj`. LLM deployment: `gpt-5-mini-argus` (gpt-5-mini v2025-08-07, GlobalStandard, 50K TPM of the subscription's 500K quota, version_upgrade_option=NoAutoUpgrade; PAYG token billing as normal Azure consumption). Endpoint `https://argus-dev-foundry-to614f.services.ai.azure.com/openai/v1/`, called with the deployment name as `model`. RBAC: current az CLI identity has "Cognitive Services User" on the account (dev-only bridge, same caveat as the other grants). NOTE: originally planned as claude-opus-4-8 -- blocked by subscription-level 0-TPM Claude quota; see Architectural Decisions Log.
-- Budget alert: `argus-dev-budget`, $75/month, 50/75/90% notifications to the alert email in the (gitignored) terraform.tfvars
+- Budget alert: `argus-dev-budget`, $100/month (raised from $75 in the 2026-07-12 session), 50/75/90% notifications to the alert email in the (gitignored) terraform.tfvars
 
 Connection strings, keys, the subscription ID, the alert email, and the random suffix's source are in Terraform state / terraform.tfvars (both gitignored) -- never in this file. (2026-07-11 security pass: subscription ID and alert email were previously written out in full here and in terraform.tfvars/variables.tf; redacted and purged from git history -- see Architectural Decisions Log.)
 
 ## Known Issues / TODO
-- DEMO-STATE CONSISTENCY (created 2026-07-12, needs a decision in Chunk 12):
-  the enterprise benchmark DROPPED the old 5.4K-vertex subset (which had
-  gnn_risk_score + Chunk 8 SAR drafts on its accounts) and loaded the FULL
-  40,289-account graph. Cosmos is now back at 1,000 RU/s (dev baseline) but
-  holds the FULL graph, only PARTIALLY scored (the ~48 inference batches
-  drained before I stopped the run to save meter cost scored a subset of
-  accounts), and with NO SAR drafts (the drop wiped them; the orchestrator
-  wasn't re-run). So Chunk 9's Tableau extract and Chunk 8's SARs are now
-  stale against live Cosmos. Chunk 12 must either (a) finish full-graph
-  inference offline at dev tier (free but slow at 1,000 RU/s) + re-run the
-  orchestrator to restore a coherent scored+SAR state, or (b) reload the
-  original subset. Flagged prominently, not silently left broken.
+- RESOLVED-ENOUGH 2026-07-12 (Chunk 12) then MOOT (teardown): the enterprise
+  benchmark dropped the old scored+SAR subset and loaded the full
+  40,289-account graph, leaving it only partially scored with no SAR drafts.
+  Before the grant expired, the 315 ring members were re-scored via a real
+  forward pass (284 flagged >0.5, matching the full-graph eval's TP count)
+  and a fresh 3-draft SAR batch was generated (3/3 grounded first attempt) --
+  one saved as docs/architecture/example_sar_draft.md so the repo has a real
+  current artifact. Full-graph scoring of all 40K accounts was NOT completed
+  (would have needed hours at 1,000 RU/s), but this is now moot: the account
+  is deprovisioned. A redeploy re-runs inference from scratch. Chunk 9's
+  Tableau extract regenerates by re-running its exporter against a rescored
+  graph.
 - 2026-07-12: 885 of 590,582 ACCESSED_FROM edges (0.15% of that edge type,
   0.046% of all edges) failed during the full load at one instant when
   DefaultAzureCredential returned a cached token expiring that exact second
@@ -687,7 +698,9 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   `terraform import` (zero changes to the live resource). azurerm still
   has no native resource for gremlinRoleAssignments; azapi is the
   mechanism, same as the Foundry account.
-- No agent code yet (Chunk 8 next).
+- (Historical, RESOLVED long ago) an early Known Issue "no agent code yet"
+  was closed by Chunk 8, which built the full LangGraph compliance loop
+  (agents/). Left here only so the resolution is explicit.
 - KEDA scaling limitation (Chunk 10, honest, not hidden): the deployed
   service has no checkpointing consumer, so the azure-eventhub scale
   rule's "unprocessedEventThreshold" counts ALL events retained in the
@@ -775,7 +788,7 @@ Connection strings, keys, the subscription ID, the alert email, and the random s
   load test used 10,000.
 
 ## File Map
-- `docs/` — `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` holds chunk1_data_eda_summary.md, partition_key_strategy.md, and observability_queries.md (KQL saved queries + verified TLS posture)
+- `docs/` — `ENGINEERING_JOURNEY.md` (Chunk 12: curated assumptions-corrected / bugs-found / spec-conflicts-resolved record — the headline deliverable); `specs/` holds the two master specs (POC_Blueprint.md, PDD_Production_Guide.md); `architecture/` holds chunk1_data_eda_summary.md, partition_key_strategy.md, observability_queries.md (KQL + TLS posture), architecture_diagram.md (Chunk 12: as-built Mermaid), final_resource_inventory.md (Chunk 12: last live `az resource list` + spend summary), example_sar_draft.md (Chunk 12: real regenerated SAR artifact)
 - `data/` — `scripts/` holds `graph_schema.py` (shared vertex/edge schema + real-data derivation), `acquire_ieee_cis.py` (Kaggle acquisition + bundled-sample fallback), `ring_injector.py` (synthetic ring injection), `eda_report.py` (validation/EDA); `raw/` and `simulated/` are gitignored but currently populated (bundled sample + 45 injected rings) — regenerate anytime via the three scripts in order
 - `ingestion/` — real Cargo crate (11 passing tests): `src/lib.rs` (structs, `Sink` trait, SHA-256 PII masking, `azure_credential()` MI/dev chain, `fetch_pii_salt()` Key Vault fetch, `VelocityTracker` real trailing-60s window, `DeadLetter` flushed JSONL, `LatencyRecorder` real per-event/per-batch timing added Chunk 11), `src/event_hub_sink.rs` (Entra auth, Chunk 11: internal batching via create_batch/try_add_event_data/send_batch -- real throughput fix, ~15 evt/s -> 14,675-15,151 evt/s -- `Sink` trait interface unchanged), `src/main.rs` (`ARGUS_MODE=service` for the deployed container; `ARGUS_SINK=eventhub`, `ARGUS_EVENT_LIMIT`, `ARGUS_MEASURE_LATENCY`), `examples/eventhub_validate.rs`, `Dockerfile` + `.dockerignore` (multi-stage, 141MB, non-root)
 - `ml/` — `model_def.py` (shared InstitutionalFraudSAGE class), `requirements.txt`; `training/` holds `features.py` (POC section 3 features + Account graph construction), `train_gnn.py` (real training loop, MLflow sqlite tracking, honest eval, artifact export), and `eval_full_scale.py` (Chunk 11: reuses train_gnn.py's exact eval_split/ring_component_split to evaluate against ALL known ring labels, not just the held-out test split -- directly comparable numbers); `artifacts/` holds model.pt + model_config.json + feature_stats.json (committed -- inference loads these); `inference/` holds `inference_service.py` (Event Hubs consumer -> incremental state -> GNN scoring -> Cosmos write-back, `--validate` for post-run checks, `ARGUS_INFERENCE_BATCH_SIZE` added Chunk 11) + `prepare_validation_events.py`. NOTE: run ML code with `.venv/Scripts/python.exe` (torch lives in the repo venv, not global Python)
@@ -1381,4 +1394,36 @@ for architectural reasons (batch-pipeline depth for ingestion; CPU
 full-graph forward for inference), not resource starvation. Throwing more
 money at tiers does not fix them -- code/architecture changes would.
 
-Last updated: 2026-07-12 by Claude Code
+## Session Log (final entry)
+- 2026-07-12 — Claude Code — Chunk 12 — Docs polish & demo packaging (v1.0),
+  under time pressure (credit grant expired end of day). STEP 0 (live
+  captures, done first/fast while Azure was up): saved the last
+  `az resource list` + spend summary to
+  docs/architecture/final_resource_inventory.md (10 resources, Premium
+  benchmark namespace confirmed already deleted; Cost Mgmt API $2.68 MTD but
+  lagging, runtime estimate ~$40-45 total grant spend); cargo test 11/11
+  green (no formal Python test suite -- the validation scripts serve that
+  role); closed the "no SAR drafts" gap for real -- scored the 315 ring
+  members via a genuine forward pass (284 flag >0.5, matching full-graph
+  eval TP) and ran the orchestrator (3/3 SARs grounded first try,
+  docs/architecture/example_sar_draft.md saved); scale-down was a no-op (EH
+  already 1 TU, app already min 0/max 1). Two transient failures en route (a
+  Gremlin DNS blip, then a Windows asyncio-cleanup crash in gremlinpython's
+  async client) were worked around by using the loader's reliable
+  synchronous client -- Azure access confirmed live throughout (subscription
+  Enabled). STEP 1: docs/ENGINEERING_JOURNEY.md -- the headline deliverable,
+  ~18 curated findings (assumption/actual/verified/changed) mined from this
+  whole file, written in the same honest register, explicitly NOT oversold.
+  STEP 2: full README rewrite -- real dev+enterprise SLO scorecard (2 PASS /
+  2 FAIL, misses marked), Known Limitations (synthetic labels, gpt-5-mini
+  quota, the two latency misses, teardown/redeploy), journey link up top,
+  context.md explainer. STEP 3: docs/architecture/architecture_diagram.md --
+  as-built Mermaid with tier swap points. STEP 4: this coherence pass fixed
+  three real stale-fact contradictions in the current-state sections
+  (Gremlin RBAC "not Terraform-tracked" -> tracked via azapi; Cosmos "5,387
+  subset loaded" -> full-corpus benchmark history; budget $75 -> $100; the
+  "no agent code yet" leftover), added a TORN-DOWN banner to the Environment
+  section, committed, tagged v1.0. Audit Flags printed unedited in the final
+  session summary.
+
+Last updated: 2026-07-12 by Claude Code (v1.0 — project complete)
