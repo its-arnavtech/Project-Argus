@@ -31,5 +31,11 @@ Generated from `data/simulated/` (acquisition data_source: `real_kaggle`, seed: 
 | device_cluster | 10 | 4.20 | N/A (device-shared only) |
 | smurfing | 15 | 11.60 | 1.82 |
 
+> **"Avg hop distance" here = intra-ring path length** of an injected ring
+> (a property of the ring's own topology). This is **not** the same metric as
+> the Tableau extract's `hop_distance` column, which is BFS distance *from
+> flagged accounts* across the whole graph. Same term, two definitions — see
+> Issue #6.
+
 - Total rings injected: **45**
 - Total ring-member accounts: **315**

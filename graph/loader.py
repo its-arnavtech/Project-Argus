@@ -82,12 +82,30 @@ N_LEGIT_SAMPLE = 1500  # legit accounts sampled alongside all 315 ring members
 MAX_RETRIES = 6
 
 
+# Issue #12: refresh proactively when the token is within this margin of its
+# ACTUAL expiry, rather than on a fixed wall-clock age. The old fixed-30-min
+# budget let one cluster of 885 edges fail when DefaultAzureCredential handed
+# back a cached token expiring that exact second.
+TOKEN_REFRESH_MARGIN_SEC = 300
+
+
+def get_cosmos_token_with_expiry() -> tuple[str, int]:
+    """Entra ID token (scoped to the Cosmos data-plane audience) plus its
+    epoch expiry. Requires a Gremlin RBAC role assignment on the caller's
+    identity. No static key, no ARGUS_COSMOS_KEY, nothing to leak."""
+    tok = DefaultAzureCredential().get_token("https://cosmos.azure.com/.default")
+    return tok.token, int(tok.expires_on)
+
+
 def get_cosmos_token() -> str:
-    """Entra ID token, scoped to the Cosmos data-plane audience -- requires
-    a Gremlin RBAC role assignment on the caller's identity (see
-    infra/envs/dev/main.tf's dev_cosmos_gremlin_data_contributor). No
-    static key, no ARGUS_COSMOS_KEY env var, nothing to leak or rotate."""
-    return DefaultAzureCredential().get_token("https://cosmos.azure.com/.default").token
+    """Just the token string, for callers that don't manage refresh."""
+    return get_cosmos_token_with_expiry()[0]
+
+
+def _token_needs_refresh(expires_on: int, now: float, margin_sec: float = TOKEN_REFRESH_MARGIN_SEC) -> bool:
+    """Pure predicate (unit-tested): true once we're within `margin_sec` of
+    the token's actual expiry."""
+    return now >= expires_on - margin_sec
 
 
 def make_client(token: str, pool_size: int = 4) -> gclient.Client:
@@ -115,16 +133,20 @@ class ClientHolder:
     fully-drained chunks so no in-flight op is ever using a client being
     closed. Reactive detection is kept as a broadened backstop."""
 
-    def __init__(self, pool_size: int, max_age_sec: float = 1800.0):
+    def __init__(self, pool_size: int, max_age_sec: float | None = None):
         self.pool_size = pool_size
-        self.max_age_sec = max_age_sec
+        # max_age_sec kept as a belt-and-suspenders cap in case a credential
+        # ever returns no/garbage expiry; the primary signal is real expiry.
+        self.max_age_sec = max_age_sec if max_age_sec is not None else 3600.0
         self.lock = threading.Lock()
-        self.client = make_client(get_cosmos_token(), pool_size)
+        token, self.expires_on = get_cosmos_token_with_expiry()
+        self.client = make_client(token, pool_size)
         self.created_at = time.time()
 
     def _rebuild(self) -> None:
         old = self.client
-        self.client = make_client(get_cosmos_token(), self.pool_size)
+        token, self.expires_on = get_cosmos_token_with_expiry()
+        self.client = make_client(token, self.pool_size)
         self.created_at = time.time()
         try:
             old.close()
@@ -132,10 +154,13 @@ class ClientHolder:
             pass
 
     def maybe_refresh(self) -> None:
-        """Proactive: rebuild if the token is older than the budget. Safe to
-        call ONLY when no futures are in flight (between drained chunks)."""
-        if time.time() - self.created_at >= self.max_age_sec:
-            print("[LOADER] proactive token refresh (client age exceeded budget)", flush=True)
+        """Proactive: rebuild if the current token is within the refresh
+        margin of its ACTUAL expiry (or, as a fallback cap, older than
+        max_age_sec). Safe to call ONLY when no futures are in flight
+        (between drained chunks)."""
+        now = time.time()
+        if _token_needs_refresh(self.expires_on, now) or (now - self.created_at >= self.max_age_sec):
+            print("[LOADER] proactive token refresh (near actual expiry)", flush=True)
             self._rebuild()
 
     def refresh(self, dead_client) -> None:

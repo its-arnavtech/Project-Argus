@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import sys
 import threading
 import time
@@ -247,6 +248,20 @@ class InferenceService:
         self.stop_event = threading.Event()
         self.last_event_time = time.time()
 
+        # Issue #7: gremlinpython's concurrent submit_async path intermittently
+        # crashes on Windows (asyncio ProactorEventLoop teardown, WinError 87)
+        # and cost two failed score-write runs in the Chunk-12 session. The
+        # synchronous submit path is rock-solid on every platform (it's what
+        # graph/loader.py and batch_score_accounts.py use). So: sync writes on
+        # Windows (or when forced via ARGUS_SYNC_WRITES=1), concurrent async on
+        # Linux where the deployed container runs and the proactor bug doesn't
+        # occur -- keeping the Chunk-12 write-latency win where it's safe.
+        self._sync_writes = (
+            platform.system() == "Windows"
+            or os.environ.get("ARGUS_SYNC_WRITES") == "1"
+        )
+        print(f"[INFERENCE] Cosmos write mode: {'synchronous' if self._sync_writes else 'concurrent-async'}")
+
     def score_and_write(self, affected: set[int], batch_t0: float) -> None:
         t_prep0 = time.time()
         x, edge_index = self.state.tensors()
@@ -256,34 +271,39 @@ class InferenceService:
             prob1 = self.model(x, edge_index).exp()[:, 1].numpy()
         t_forward = time.time()
 
-        # Post-Chunk-11 fix: concurrent writes via submit_async over the
-        # client's connection pool (was: strictly sequential .result() per
-        # write). Futures are gathered after all submits, so wall time is
-        # ~(writes / pool_size) round trips instead of (writes) round trips.
-        futures = []
+        # Writes: concurrent submit_async over the connection pool on Linux
+        # (Chunk-11 latency win), synchronous submit on Windows (Issue #7 --
+        # avoids the ProactorEventLoop teardown crash). Same query and bindings
+        # either way; only the dispatch differs.
+        query = (
+            "g.V(aid).has('partitionKey', pk)"
+            ".property('gnn_risk_score', s).property('gnn_scored_at', ts)"
+        )
         ts_now = int(time.time())
-        for node in affected:
-            aid = self.state.acct_ids[node]
-            if aid not in self.cosmos_accounts:
-                continue
-            futures.append(
-                self.gclient.submit_async(
-                    message=(
-                        "g.V(aid).has('partitionKey', pk)"
-                        ".property('gnn_risk_score', s).property('gnn_scored_at', ts)"
-                    ),
-                    bindings={
-                        "aid": aid,
-                        "pk": PARTITION_KEY_VALUE,
-                        "s": float(prob1[node]),
-                        "ts": ts_now,
-                    },
-                )
-            )
+        targets = [
+            (self.state.acct_ids[node], float(prob1[node]))
+            for node in affected
+            if self.state.acct_ids[node] in self.cosmos_accounts
+        ]
         writes = 0
-        for fut in futures:
-            fut.result().all().result()
-            writes += 1
+        if self._sync_writes:
+            for aid, score in targets:
+                self.gclient.submit(
+                    message=query,
+                    bindings={"aid": aid, "pk": PARTITION_KEY_VALUE, "s": score, "ts": ts_now},
+                ).all().result()
+                writes += 1
+        else:
+            futures = [
+                self.gclient.submit_async(
+                    message=query,
+                    bindings={"aid": aid, "pk": PARTITION_KEY_VALUE, "s": score, "ts": ts_now},
+                )
+                for aid, score in targets
+            ]
+            for fut in futures:
+                fut.result().all().result()
+                writes += 1
         t_done = time.time()
         self.scored_total += writes
         n_events = max(len(affected) // 2, 1)

@@ -30,13 +30,20 @@ from __future__ import annotations
 from itertools import combinations
 from pathlib import Path
 
+import os
 import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SIM_DIR = REPO_ROOT / "data" / "simulated"
 
-SHARING_CAP = 10  # max accounts sharing a device/IP before it's treated as generic
+# Max accounts sharing a device/IP before it's treated as a generic
+# identifier (e.g. an OS string) and no pairwise edges are added. Issue #5:
+# this was a hard-coded magic number; it's now overridable via env so its
+# effect on PR-AUC / FP-rate can actually be swept, rather than being an
+# untunable constant. 10 remains the default the committed model was trained
+# with -- changing it means retraining for consistent train/serve features.
+SHARING_CAP = int(os.environ.get("ARGUS_SHARING_CAP", "10"))
 
 
 def build_features_and_graph():
