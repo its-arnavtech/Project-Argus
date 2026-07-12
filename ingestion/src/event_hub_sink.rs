@@ -179,7 +179,10 @@ impl EventHubSink {
     ) {
         let mut items = items.into_iter().peekable();
         while items.peek().is_some() {
-            let mut batch = match producer.create_batch(Some(EventDataBatchOptions::default())).await {
+            let mut batch = match producer
+                .create_batch(Some(EventDataBatchOptions::default()))
+                .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     let msg = format!("failed to create batch: {e}");
@@ -239,7 +242,11 @@ impl EventHubSink {
                         batch = rebuilt;
                         continue;
                     }
-                    Err(e) => break Err(format!("batch send failed after {SEND_MAX_ATTEMPTS} attempts: {e}")),
+                    Err(e) => {
+                        break Err(format!(
+                            "batch send failed after {SEND_MAX_ATTEMPTS} attempts: {e}"
+                        ))
+                    }
                 }
             };
 

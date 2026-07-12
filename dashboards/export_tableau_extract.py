@@ -32,7 +32,14 @@ with per-account graph attributes. Columns (superset of what PDD section
                                        null for unscored accounts
   hop_distance                      -- min hops (undirected FUNDS_TRANSFER)
                                        from the nearest flagged account
-                                       (gnn_risk_score > 0.5); 0 for flagged
+                                       (gnn_risk_score > 0.5); 0 for flagged.
+                                       NOTE (Issue #6): this is BFS distance
+                                       FROM flagged accounts across the whole
+                                       graph -- a DIFFERENT quantity from the
+                                       ring manifest's / EDA summary's "avg
+                                       hop distance", which is the intra-ring
+                                       path length of an injected ring. Same
+                                       words, different metric.
                                        accounts themselves, null if
                                        unreachable within HOP_CAP
   is_ring_member, ring_type         -- ground-truth labels for demo overlays

@@ -120,7 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .ok()
             .and_then(|v| v.parse().ok());
         if let Some(p) = pace {
-            println!("[INITIALIZATION] Pacing input at {p} events/sec (ARGUS_PACE_EVENTS_PER_SEC).");
+            println!(
+                "[INITIALIZATION] Pacing input at {p} events/sec (ARGUS_PACE_EVENTS_PER_SEC)."
+            );
         }
         let pace_start = std::time::Instant::now();
 
